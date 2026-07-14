@@ -1,0 +1,18 @@
+# vendor checkouts (cloned by scripts, never committed)
+third_party/
+
+# model weights and heavy artifacts
+*.gguf
+weights/
+traces/
+*.nsys-rep
+*.sqlite
+
+# build output
+build/
+__pycache__/
+*.pyc
+.venv/
+
+# raw bench dumps (curated summaries are committed under results/)
+results/raw/
