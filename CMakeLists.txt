@@ -31,6 +31,10 @@ include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
+    # host code is C++20 but CUDA TUs stay on 17: older CMake (<3.24) has no
+    # CUDA20 dialect table and nothing in the .cu files needs 20
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES 90)  # H100; use 120 for RTX 5090
     endif()
