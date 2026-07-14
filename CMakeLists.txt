@@ -10,6 +10,7 @@ endif()
 add_library(bt_core
     src/gguf.cpp
     src/packs.cpp
+    src/retile.cpp
 )
 target_include_directories(bt_core PUBLIC src)
 
@@ -21,13 +22,25 @@ add_executable(test_dequant tests/test_dequant.cpp)
 target_link_libraries(test_dequant PRIVATE bt_core)
 add_test(NAME dequant COMMAND test_dequant)
 
-# CUDA engine targets land here once kernels exist (guarded so CPU-only
-# checkouts still build the loader and tools).
+add_executable(test_retile tests/test_retile.cpp)
+target_link_libraries(test_retile PRIVATE bt_core)
+add_test(NAME retile COMMAND test_retile)
+
+# CUDA engine targets (guarded so CPU-only checkouts still build loader/tools).
 include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
-    message(STATUS "CUDA enabled: engine targets will build")
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 90)  # H100; use 120 for RTX 5090
+    endif()
+    message(STATUS "CUDA enabled (arch ${CMAKE_CUDA_ARCHITECTURES})")
+
+    add_library(bt_cuda src/cuda/gemv.cu)
+    target_include_directories(bt_cuda PUBLIC src)
+
+    add_executable(bt-microbench tools/bt_microbench.cu)
+    target_link_libraries(bt-microbench PRIVATE bt_core bt_cuda)
 else()
     message(STATUS "CUDA not found: building loader/tools only")
 endif()

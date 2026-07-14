@@ -29,6 +29,15 @@ image = (
     )
 )
 
+cuda_dev_image = (
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("g++", "cmake", "ninja-build")
+    .add_local_dir(
+        REPO_ROOT, "/repo",
+        ignore=["third_party", ".git", "weights", "results", "build", "__pycache__"],
+    )
+)
+
 MODELS = {
     "ternary": "/data/weights/Ternary-Bonsai-27B-Q2_0.gguf",
     "onebit": "/data/weights/Bonsai-27B-Q1_0.gguf",
@@ -65,6 +74,23 @@ def build_test(inspect: str = "", scan: bool = False) -> str:
     return "\n".join(report)
 
 
+@app.function(image=cuda_dev_image, gpu="H100", volumes={"/data": data_vol}, timeout=1200)
+def microbench(shapes: str = "", gguf: str = "", tensor: str = "") -> str:
+    _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
+    _sh(["cmake", "--build", "/tmp/build", "-j"])
+    _sh(["ctest", "--test-dir", "/tmp/build", "--output-on-failure"])
+    args = ["/tmp/build/bt-microbench"]
+    if gguf:
+        args += ["--gguf", MODELS.get(gguf, gguf), tensor]
+    elif shapes:
+        args += [shapes]
+    return _sh(args)
+
+
 @app.local_entrypoint()
-def main(inspect: str = "", scan: bool = False):
-    print(build_test.remote(inspect=inspect, scan=scan))
+def main(inspect: str = "", scan: bool = False, gpu: bool = False,
+         shapes: str = "", gguf: str = "", tensor: str = ""):
+    if gpu:
+        print(microbench.remote(shapes=shapes, gguf=gguf, tensor=tensor))
+    else:
+        print(build_test.remote(inspect=inspect, scan=scan))
