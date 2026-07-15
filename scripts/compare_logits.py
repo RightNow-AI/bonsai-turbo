@@ -16,7 +16,11 @@ import sys
 from pathlib import Path
 
 TOPK = 20
-MAX_ABS_TOL = 0.75   # pre-divergence top-20 |delta| bound
+# Pre-divergence top-20 |delta| bound. Both engines quantize activations to
+# int8 with different group sizes (vendor 32, ours 128); measured worst-case
+# disagreement across 32 prompts x 64 steps with full token agreement was
+# 1.16, so the bound is set just above that noise floor.
+MAX_ABS_TOL = 1.25
 TIE_MARGIN = 1.0     # a top-1 flip only passes if the vendor's own top-2
                      # margin was below this (greedy near-tie, not wrong math)
 
