@@ -166,6 +166,24 @@ __global__ void argmax_kernel(const float* __restrict__ x, int n, int32_t* __res
     }
 }
 
+__global__ void conv1d_step_kernel(const __half* __restrict__ x, const __half* __restrict__ w,
+                                   float* __restrict__ conv_state, __half* __restrict__ y,
+                                   int C, int k) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float* st = conv_state + (size_t)c * (k - 1);
+    const __half* wc = w + (size_t)c * k;
+    const float xn = __half2float(x[c]);
+
+    float acc = xn * __half2float(wc[k - 1]);
+    for (int i = 0; i < k - 1; ++i) acc += st[i] * __half2float(wc[i]);
+    for (int i = 0; i < k - 2; ++i) st[i] = st[i + 1];
+    st[k - 2] = xn;
+
+    const float s = acc / (1.f + expf(-acc));  // SiLU
+    y[c] = __float2half(s);
+}
+
 constexpr int kThreads = 256;
 inline int blocks_for(int n) { return (n + kThreads - 1) / kThreads; }
 
@@ -216,6 +234,11 @@ void embed_lookup_launch(const __half* table, int token, int n, __half* out,
 
 void argmax_launch(const float* x, int n, int32_t* out, cudaStream_t stream) {
     argmax_kernel<<<1, 1024, 0, stream>>>(x, n, out);
+}
+
+void conv1d_step_launch(const __half* x, const __half* w, float* conv_state,
+                        __half* y, int C, int k, cudaStream_t stream) {
+    conv1d_step_kernel<<<blocks_for(C), kThreads, 0, stream>>>(x, w, conv_state, y, C, k);
 }
 
 }  // namespace bt

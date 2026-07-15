@@ -48,4 +48,11 @@ void embed_lookup_launch(const __half* table, int token, int n, __half* out,
 // single-vector argmax (greedy sampling); out[0] = index
 void argmax_launch(const float* x, int n, int32_t* out, cudaStream_t stream);
 
+// causal conv1d decode step over C channels, kernel width k (matches
+// ggml_ssm_conv + trailing SiLU): hist = [state[c][0..k-2], x[c]];
+// y[c] = silu(sum_i hist[i] * w[c*k+i]); state shifts left by one.
+// w layout: [C][k] contiguous per channel (= GGUF ssm_conv1d, ne[0]=k), f16.
+void conv1d_step_launch(const __half* x, const __half* w, float* conv_state,
+                        __half* y, int C, int k, cudaStream_t stream);
+
 }  // namespace bt
