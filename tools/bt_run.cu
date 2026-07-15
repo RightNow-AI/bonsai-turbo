@@ -17,7 +17,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -43,6 +46,61 @@ using namespace bt;
 
 namespace {
 
+// seeded top-k / top-p / temperature sampler (host-side). Matches the model
+// card's recommended settings (temp 1.0, top_k 20, top_p 0.95); temp <= 0
+// keeps the default greedy path so parity/bench runs are unaffected.
+struct Sampler {
+    float temp = 0.f;
+    int top_k = 20;
+    float top_p = 0.95f;
+    std::mt19937 rng{42};
+
+    bool active() const { return temp > 0.f; }
+
+    int sample(const float* logits, int n) {
+        const int k = std::min(top_k > 0 ? top_k : n, n);
+        using LI = std::pair<float, int>;
+        std::vector<LI> top;  // min-heap on logit
+        top.reserve((size_t)k + 1);
+        for (int i = 0; i < n; ++i) {
+            if ((int)top.size() < k) {
+                top.push_back({logits[i], i});
+                std::push_heap(top.begin(), top.end(), std::greater<LI>());
+            } else if (logits[i] > top.front().first) {
+                std::pop_heap(top.begin(), top.end(), std::greater<LI>());
+                top.back() = {logits[i], i};
+                std::push_heap(top.begin(), top.end(), std::greater<LI>());
+            }
+        }
+        std::sort(top.begin(), top.end(), std::greater<LI>());
+        std::vector<double> p(top.size());
+        const double mx = top[0].first;
+        double sum = 0;
+        for (size_t i = 0; i < top.size(); ++i) {
+            p[i] = std::exp(((double)top[i].first - mx) / temp);
+            sum += p[i];
+        }
+        // nucleus: smallest prefix whose (normalized) mass reaches top_p
+        size_t keep = top.size();
+        double cum = 0;
+        for (size_t i = 0; i < top.size(); ++i) {
+            cum += p[i] / sum;
+            if (cum >= (double)top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+        double s2 = 0;
+        for (size_t i = 0; i < keep; ++i) s2 += p[i];
+        double r = std::uniform_real_distribution<double>(0.0, s2)(rng);
+        for (size_t i = 0; i < keep; ++i) {
+            r -= p[i];
+            if (r <= 0) return top[i].second;
+        }
+        return top[0].second;
+    }
+};
+
 // token ring: graph/mega readback indexes it linearly (no wraparound), so it
 // must hold the longest generation (MATH-500 thinking traces run to 16k)
 constexpr int kRingCap = 32768;
@@ -53,6 +111,7 @@ struct Runtime {
     int eos = -1;
     bool graph_mode = false;
     bool mega_mode = false;
+    Sampler smp;
     cudaStream_t st = nullptr;
 
     // activation buffers (f16 unless noted)
@@ -585,7 +644,37 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
     std::printf("generated:");
     int n_done = 0;
 
-    if (rt.mega_mode && lf) {
+    if (rt.smp.active()) {
+        // sampled generation: per-token sync, logits sampled on host and the
+        // chosen token written back over the kernel's argmax before the next
+        // launch (embed reads *d_tok at the start of each step)
+        if (rt.graph_mode) {
+            std::fprintf(stderr, "sampling supports --mega or eager mode\n");
+            std::exit(2);
+        }
+        CUDA_CHECK(cudaEventRecord(t0, rt.st));
+        int32_t tok = 0;
+        for (int i = 0; i < n_gen; ++i) {
+            CUDA_CHECK(cudaMemcpy(logits.data(), rt.y32, (size_t)hp.vocab * 4,
+                                  cudaMemcpyDeviceToHost));
+            if (lf) std::fwrite(logits.data(), 4, (size_t)hp.vocab, lf);
+            tok = (int32_t)rt.smp.sample(logits.data(), hp.vocab);
+            std::printf(" %d", tok);
+            ++n_done;
+            if (tok == rt.eos) break;
+            if (rt.mega_mode) {
+                CUDA_CHECK(cudaMemcpyAsync(rt.d_tok, &tok, 4,
+                                           cudaMemcpyHostToDevice, rt.st));
+                if (!mega_decode_launch(rt.mp, rt.st)) std::exit(1);
+                CUDA_CHECK(cudaStreamSynchronize(rt.st));
+                rt.pos++;
+            } else {
+                decode_eager(rt, tok);
+                CUDA_CHECK(cudaStreamSynchronize(rt.st));
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(t1, rt.st));
+    } else if (rt.mega_mode && lf) {
         // parity path: one launch per token, dumping logits before each argmax
         int32_t tok = 0;
         CUDA_CHECK(cudaMemcpy(&tok, rt.d_tok, 4, cudaMemcpyDeviceToHost));
@@ -726,6 +815,9 @@ int main(int argc, char** argv) {
     int eos = -1;
     int ctx = 8192;
     bool bench = false, graph = false, mega = false;
+    float smp_temp = 0.f, smp_topp = 0.95f;
+    int smp_topk = 20;
+    unsigned smp_seed = 42;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) model_path = argv[++i];
@@ -738,6 +830,10 @@ int main(int argc, char** argv) {
         else if (a == "--mega") mega = true;
         else if (a == "--eos" && i + 1 < argc) eos = std::atoi(argv[++i]);
         else if (a == "--ctx" && i + 1 < argc) ctx = std::atoi(argv[++i]);
+        else if (a == "--temp" && i + 1 < argc) smp_temp = (float)std::atof(argv[++i]);
+        else if (a == "--top-k" && i + 1 < argc) smp_topk = std::atoi(argv[++i]);
+        else if (a == "--top-p" && i + 1 < argc) smp_topp = (float)std::atof(argv[++i]);
+        else if (a == "--seed" && i + 1 < argc) smp_seed = (unsigned)std::atoll(argv[++i]);
     }
     if (model_path.empty() || (ids_str.empty() && ids_file.empty())) {
         std::fprintf(stderr,
@@ -763,6 +859,10 @@ int main(int argc, char** argv) {
     rt.eos = eos;
     rt.graph_mode = graph;
     rt.mega_mode = mega;
+    rt.smp.temp = smp_temp;
+    rt.smp.top_k = smp_topk;
+    rt.smp.top_p = smp_topp;
+    rt.smp.rng.seed(smp_seed);
 
     if (graph && !logits_out.empty()) {
         std::fprintf(stderr, "--graph and --logits-out are mutually exclusive\n");

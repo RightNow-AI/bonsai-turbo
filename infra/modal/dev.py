@@ -183,7 +183,10 @@ def math500(n: int = 100, max_gen: int = 16384, model: str = "ternary") -> str:
     with open("/tmp/m5/generated.txt", "w") as out:
         proc = subprocess.run(
             ["/tmp/build/bt-run", "--model", MODELS[model], "--ids-file", "/tmp/m5/ids.txt",
-             "--n", str(max_gen), "--ctx", str(max_gen + 2048), "--graph", "--eos", "248046"],
+             "--n", str(max_gen), "--ctx", str(max_gen + 2048), "--mega", "--eos", "248046",
+             # the gguf's own recommended sampling — greedy loops on long
+             # thinking traces, and the vendor's reported score uses these
+             "--temp", "1.0", "--top-k", "20", "--top-p", "0.95", "--seed", "42"],
             env=env, stdout=out, stderr=subprocess.PIPE, text=True)
     if proc.returncode:
         print(proc.stderr[-3000:])
