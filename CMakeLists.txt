@@ -45,6 +45,7 @@ if(CMAKE_CUDA_COMPILER)
     add_library(bt_cuda
         src/cuda/gemv.cu
         src/cuda/ops.cu
+        src/cuda/gdn.cu
     )
     target_include_directories(bt_cuda PUBLIC src)
 
