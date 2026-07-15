@@ -236,7 +236,9 @@ __device__ void op_gemv(const MegaParams& p, const MegaLayer* l, const MegaMat& 
                 }
             }
         }
-        __syncthreads();  // s_a8 reused across tiles; keep warps in step
+        // NO barrier here: s_a8/s_scale/s_gsum are read-only after staging, so
+        // warps free-run across tiles — a sync would drain the memory pipeline
+        // at every tile boundary (measured 3-5x slowdown on 2-4-round matrices)
     }
 
     if (EPI == 2 && norm_slot >= 0) {
