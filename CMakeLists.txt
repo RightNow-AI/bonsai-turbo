@@ -46,6 +46,7 @@ if(CMAKE_CUDA_COMPILER)
         src/cuda/gemv.cu
         src/cuda/ops.cu
         src/cuda/gdn.cu
+        src/cuda/attn.cu
     )
     target_include_directories(bt_cuda PUBLIC src)
 
