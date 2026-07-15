@@ -26,7 +26,8 @@ image = (
 def build() -> bytes:
     for cmd in (
         ["pdflatex", "-interaction=nonstopmode", "-output-directory", "/tmp", "/work/overview.tex"],
-        ["pdftoppm", "-png", "-r", "220", "-singlefile", "/tmp/overview.pdf", "/tmp/overview"],
+        ["pdftoppm", "-png", "-scale-to-x", "2560", "-scale-to-y", "1280",
+         "-singlefile", "/tmp/overview.pdf", "/tmp/overview"],
     ):
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode:
