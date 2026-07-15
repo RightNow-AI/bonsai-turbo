@@ -115,7 +115,9 @@ __global__ void gemv_kernel(const uint8_t* __restrict__ codes,
     for (int c = c0 + li; c < c1; c += 8) {
         const uint4 cw = row_codes[c];
         const uint32_t cws[4] = {cw.x, cw.y, cw.z, cw.w};
-        int dot = 0;
+        // one accumulator per code word: 4 independent dp4a chains (ILP),
+        // summed once per chunk
+        int dots[4] = {0, 0, 0, 0};
 
         if (NBITS == 2) {
             // chunk c covers codes [64c, 64c+64) = activation bytes [64c, 64c+64)
@@ -124,11 +126,12 @@ __global__ void gemv_kernel(const uint8_t* __restrict__ codes,
             for (int wnum = 0; wnum < 4; ++wnum) {
                 const uint4 av = aw[wnum];
                 const uint32_t w = cws[wnum];
-                dot = dp4a_u8s8(w & 0x03030303u, av.x, dot);
-                dot = dp4a_u8s8((w >> 2) & 0x03030303u, av.y, dot);
-                dot = dp4a_u8s8((w >> 4) & 0x03030303u, av.z, dot);
-                dot = dp4a_u8s8((w >> 6) & 0x03030303u, av.w, dot);
+                dots[wnum] = dp4a_u8s8(w & 0x03030303u, av.x, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 2) & 0x03030303u, av.y, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 4) & 0x03030303u, av.z, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 6) & 0x03030303u, av.w, dots[wnum]);
             }
+            const int dot = (dots[0] + dots[1]) + (dots[2] + dots[3]);
             const int g = c >> 1;  // 2 chunks per 128-group
             const float wd = __half2float(row_scale[g]);
             acc += wd * s_scale[g - g0] * (float)(dot - s_gsum[c - 2 * g0]);
@@ -140,15 +143,16 @@ __global__ void gemv_kernel(const uint8_t* __restrict__ codes,
                 const uint32_t w = cws[wnum];
                 const uint4 av0 = aw[wnum * 2];
                 const uint4 av1 = aw[wnum * 2 + 1];
-                dot = dp4a_u8s8(w & 0x01010101u, av0.x, dot);
-                dot = dp4a_u8s8((w >> 1) & 0x01010101u, av0.y, dot);
-                dot = dp4a_u8s8((w >> 2) & 0x01010101u, av0.z, dot);
-                dot = dp4a_u8s8((w >> 3) & 0x01010101u, av0.w, dot);
-                dot = dp4a_u8s8((w >> 4) & 0x01010101u, av1.x, dot);
-                dot = dp4a_u8s8((w >> 5) & 0x01010101u, av1.y, dot);
-                dot = dp4a_u8s8((w >> 6) & 0x01010101u, av1.z, dot);
-                dot = dp4a_u8s8((w >> 7) & 0x01010101u, av1.w, dot);
+                dots[wnum] = dp4a_u8s8(w & 0x01010101u, av0.x, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 1) & 0x01010101u, av0.y, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 2) & 0x01010101u, av0.z, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 3) & 0x01010101u, av0.w, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 4) & 0x01010101u, av1.x, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 5) & 0x01010101u, av1.y, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 6) & 0x01010101u, av1.z, dots[wnum]);
+                dots[wnum] = dp4a_u8s8((w >> 7) & 0x01010101u, av1.w, dots[wnum]);
             }
+            const int dot = (dots[0] + dots[1]) + (dots[2] + dots[3]);
             const int g = c;
             const float wd = __half2float(row_scale[g]);
             const int gsum = s_gsum[2 * (c - g0)] + s_gsum[2 * (c - g0) + 1];
