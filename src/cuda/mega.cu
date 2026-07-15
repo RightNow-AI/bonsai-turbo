@@ -57,6 +57,7 @@ enum StageSrc {
     SRC_GDN_GATE = 1,  // silu(z) * headnorm(gdn_out) * ssm_norm
     SRC_ATTN_GATE = 2, // attn_out * sigmoid(gate from interleaved qg)
     SRC_SWIGLU = 3,    // silu(gate) * up from fused [gate|up]
+    SRC_FROM_A8 = 4,   // copy the globally pre-quantized activation buffers
 };
 
 // quantize one 128-group of vals held per-lane (4 each) into block-local smem
@@ -158,8 +159,14 @@ __device__ void op_gemv(const MegaParams& p, const MegaLayer* l, const MegaMat& 
     float* s_scale = reinterpret_cast<float*>(smem + K);
     int32_t* s_gsum = reinterpret_cast<int32_t*>(smem + K + (K / 128) * 4);
 
-    // fused staging: producer op + int8 quantization, block-local
-    {
+    // staging: raw copy of pre-quantized buffers, or fused producer+quant
+    if (SRC == SRC_FROM_A8) {
+        for (int i = threadIdx.x; i < K / 16; i += blockDim.x) {
+            reinterpret_cast<uint4*>(s_a8)[i] = reinterpret_cast<const uint4*>(p.a8)[i];
+        }
+        for (int i = threadIdx.x; i < K / 128; i += blockDim.x) s_scale[i] = p.a_scale[i];
+        for (int i = threadIdx.x; i < K / 64; i += blockDim.x) s_gsum[i] = p.a_gsum[i];
+    } else {
         const int warp = threadIdx.x / 32;
         const int warps = (int)blockDim.x / 32;
         float vals[4];
@@ -243,6 +250,26 @@ __device__ void op_gemv(const MegaParams& p, const MegaLayer* l, const MegaMat& 
             for (int i = 0; i < (int)blockDim.x / 32; ++i) t += warp_acc[i];
             atomicAdd(&p.red_scratch[norm_slot], t);
         }
+    }
+}
+
+// one-shot global quantization for a producer op: each 128-group handled by
+// exactly one warp grid-wide (cheap ops recompute in gemv staging instead)
+template <int SRC>
+__device__ void op_quant_global(const MegaParams& p, const MegaLayer& l, int n,
+                                const MegaMat& next, int bid, int nblocks) {
+    const int warps_per_block = (int)blockDim.x / 32;
+    const int busy = (n / 128 + warps_per_block - 1) / warps_per_block;
+    if (bid >= busy) {
+        prefetch_l2(p, next, bid - busy, nblocks - busy, 1024);
+        return;
+    }
+    const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
+    const int warps_total = min(nblocks, busy) * warps_per_block;
+    float vals[4];
+    for (int g = warp; g < n / 128; g += warps_total) {
+        stage_vals<SRC>(p, &l, 0.f, nullptr, g, vals);
+        quantize_vals(vals, g, p.a8, p.a_scale, p.a_gsum);
     }
 }
 
@@ -625,25 +652,30 @@ mega_decode_kernel(MegaParams p) {
             grid.sync();
             op_gdn(p, l, bid, nb);
             grid.sync();
-            op_gemv<2, SRC_GDN_GATE>(p, &l, l.out_proj, p.x, nullptr,
-                                     base + 2 * il + 1, 0.f, nullptr, smem, bid, nb);
+            op_quant_global<SRC_GDN_GATE>(p, l, p.ssm_dt_rank * p.head_v_dim,
+                                          l.out_proj, bid, nb);
         } else {
             op_attn_prep(p, l, bid, nb);
             grid.sync();
             op_attn(p, l, bid, nb, smem);
             grid.sync();
-            op_gemv<2, SRC_ATTN_GATE>(p, &l, l.out_proj, p.x, nullptr,
-                                      base + 2 * il + 1, 0.f, nullptr, smem, bid, nb);
+            op_quant_global<SRC_ATTN_GATE>(p, l, p.n_head * p.head_dim,
+                                           l.out_proj, bid, nb);
         }
+        grid.sync();
+        op_gemv<2, SRC_FROM_A8>(p, &l, l.out_proj, p.x, nullptr,
+                                base + 2 * il + 1, 0.f, nullptr, smem, bid, nb);
         grid.sync();
         const float inv2 = rsqrtf(rs[base + 2 * il + 1] / p.n_embd + p.rms_eps);
         op_gemv<1, SRC_NORM_X>(p, &l, l.gate_up, nullptr, p.big_a, -1, inv2,
                                l.post_norm, smem, bid, nb);
         grid.sync();
+        op_quant_global<SRC_SWIGLU>(p, l, p.n_ff, l.down, bid, nb);
+        grid.sync();
         const int next_slot =
             il + 1 < p.n_layer ? base + 2 * (il + 1) : base + 2 * p.n_layer;
-        op_gemv<2, SRC_SWIGLU>(p, &l, l.down, p.x, nullptr, next_slot, 0.f,
-                               nullptr, smem, bid, nb);
+        op_gemv<2, SRC_FROM_A8>(p, &l, l.down, p.x, nullptr, next_slot, 0.f,
+                                nullptr, smem, bid, nb);
         grid.sync();
     }
 
