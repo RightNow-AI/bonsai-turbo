@@ -32,6 +32,7 @@ image = (
 cuda_dev_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("g++", "cmake", "ninja-build")
+    .pip_install("jinja2", "gguf", "requests")
     .add_local_dir(
         REPO_ROOT, "/repo",
         ignore=["third_party", ".git", "weights", "results", "build", "__pycache__"],
@@ -162,12 +163,46 @@ def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2")
     return "done"
 
 
+@app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol},
+              timeout=3 * 3600)
+def math500(n: int = 100, max_gen: int = 3072, model: str = "ternary") -> str:
+    import os
+
+    _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
+    _sh(["cmake", "--build", "/tmp/build", "-j"])
+    env = {**os.environ, "LD_LIBRARY_PATH": "/data/fork/build/bin"}
+    _sh(["python3", "/repo/scripts/math500.py", "prepare", "--model", MODELS[model],
+         "--tokenizer-bin", "/data/fork/build/bin/llama-tokenize",
+         "--out", "/tmp/m5", "--n", str(n)])
+    with open("/tmp/m5/generated.txt", "w") as out:
+        proc = subprocess.run(
+            ["/tmp/build/bt-run", "--model", MODELS[model], "--ids-file", "/tmp/m5/ids.txt",
+             "--n", str(max_gen), "--graph", "--eos", "248046"],
+            env=env, stdout=out, stderr=subprocess.PIPE, text=True)
+    if proc.returncode:
+        print(proc.stderr[-3000:])
+        raise RuntimeError("generation failed")
+    grade = subprocess.run(
+        ["python3", "/repo/scripts/math500.py", "grade", "--model", MODELS[model],
+         "--generated", "/tmp/m5/generated.txt", "--refs", "/tmp/m5/refs.json"],
+        capture_output=True, text=True)
+    print(grade.stdout[-6000:])
+    Path("/data/results").mkdir(exist_ok=True)
+    Path("/data/results/math500.txt").write_text(grade.stdout)
+    data_vol.commit()
+    if grade.returncode:
+        raise RuntimeError("MATH-500 gate failed")
+    return grade.stdout[-2000:]
+
+
 @app.local_entrypoint()
 def main(inspect: str = "", scan: bool = False, gpu: bool = False,
          shapes: str = "", gguf: str = "", tensor: str = "",
          run_parity: bool = False, run_speed: bool = False, run_probe: bool = False,
-         n_gen: int = 64, model: str = "ternary"):
-    if run_probe:
+         run_math: bool = False, n_gen: int = 64, model: str = "ternary"):
+    if run_math:
+        print(math500.remote(model=model))
+    elif run_probe:
         print(debug_probe.remote(model=model))
     elif run_parity:
         print(parity.remote(n_gen=n_gen, model=model))
