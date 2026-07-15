@@ -98,32 +98,64 @@ def detok(ids, tokens):
 
 
 def extract_boxed(text: str):
-    idx = text.rfind("\\boxed{")
-    if idx < 0:
+    # last NON-EMPTY \boxed{...}
+    idx = len(text)
+    while True:
+        idx = text.rfind("\\boxed{", 0, idx)
+        if idx < 0:
+            return None
+        depth = 0
+        start = idx + len("\\boxed{")
+        for j in range(start - 1, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    inner = text[start:j]
+                    if inner.strip():
+                        return inner
+                    break
+        # empty or unterminated: keep scanning backwards
+
+
+def as_number(a: str):
+    m = re.fullmatch(r"-?\\frac\{(-?\d+)\}\{(-?\d+)\}", a)
+    if m:
+        v = int(m.group(1)) / int(m.group(2))
+        return -v if a.startswith("-\\") else v
+    m = re.fullmatch(r"(-?\d+)/(-?\d+)", a)
+    if m:
+        return int(m.group(1)) / int(m.group(2))
+    try:
+        return float(a.replace(",", ""))
+    except ValueError:
         return None
-    depth = 0
-    start = idx + len("\\boxed{")
-    for j in range(start - 1, len(text)):
-        if text[j] == "{":
-            depth += 1
-        elif text[j] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:j]
-    return None
 
 
 def normalize(ans: str) -> str:
     if ans is None:
         return "<none>"
-    a = ans.strip()
+    a = ans.strip().lower()
     a = a.replace("\\left", "").replace("\\right", "").replace("\\!", "")
     a = a.replace("dfrac", "frac").replace("tfrac", "frac")
+    a = a.replace("\\$", "").replace("$", "").replace("\\%", "").replace("%", "")
+    a = a.replace("^\\circ", "").replace("^{\\circ}", "")
+    a = re.sub(r"\\text\{[^}]*\}", "", a)  # unit annotations
+    a = re.sub(r"\\mbox\{[^}]*\}", "", a)
     a = re.sub(r"\s+", "", a)
-    a = re.sub(r"^\\text\{(.*)\}$", r"\1", a)
+    a = re.sub(r"^[a-z]=", "", a)          # "x=5" -> "5"
+    a = re.sub(r"\\sqrt\{(\w)\}", r"\\sqrt\1", a)  # \sqrt{2} -> \sqrt2
     if re.fullmatch(r"-?\d+\.0+", a):
         a = a.split(".")[0]
     return a
+
+
+def answers_match(got: str, want: str) -> bool:
+    if got == want:
+        return True
+    ng, nw = as_number(got), as_number(want)
+    return ng is not None and nw is not None and abs(ng - nw) < 1e-9
 
 
 def cmd_prepare(args):
@@ -178,7 +210,7 @@ def cmd_grade(args):
         text = detok([int(t) for t in gens[i]], tokens)
         got = normalize(extract_boxed(text))
         want = normalize(ref["answer"])
-        ok = got == want
+        ok = answers_match(got, want)
         correct += ok
         if not ok:
             print(f"  #{i} MISS: got {got!r} want {want!r}")

@@ -165,7 +165,7 @@ def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2")
 
 @app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol},
               timeout=3 * 3600)
-def math500(n: int = 100, max_gen: int = 3072, model: str = "ternary") -> str:
+def math500(n: int = 100, max_gen: int = 8192, model: str = "ternary") -> str:
     import os
 
     os.environ["LD_LIBRARY_PATH"] = "/data/fork/build/bin"
@@ -178,7 +178,7 @@ def math500(n: int = 100, max_gen: int = 3072, model: str = "ternary") -> str:
     with open("/tmp/m5/generated.txt", "w") as out:
         proc = subprocess.run(
             ["/tmp/build/bt-run", "--model", MODELS[model], "--ids-file", "/tmp/m5/ids.txt",
-             "--n", str(max_gen), "--graph", "--eos", "248046"],
+             "--n", str(max_gen), "--ctx", str(max_gen + 2048), "--graph", "--eos", "248046"],
             env=env, stdout=out, stderr=subprocess.PIPE, text=True)
     if proc.returncode:
         print(proc.stderr[-3000:])

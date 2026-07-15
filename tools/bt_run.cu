@@ -475,6 +475,7 @@ int main(int argc, char** argv) {
     std::string model_path, ids_str, ids_file, logits_out;
     int n_gen = 32;
     int eos = -1;
+    int ctx = 8192;
     bool bench = false, graph = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -486,6 +487,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench") bench = true;
         else if (a == "--graph") graph = true;
         else if (a == "--eos" && i + 1 < argc) eos = std::atoi(argv[++i]);
+        else if (a == "--ctx" && i + 1 < argc) ctx = std::atoi(argv[++i]);
     }
     if (model_path.empty() || (ids_str.empty() && ids_file.empty())) {
         std::fprintf(stderr,
@@ -495,6 +497,7 @@ int main(int argc, char** argv) {
     }
 
     Runtime rt;
+    rt.max_ctx = ctx;
     std::fprintf(stderr, "loading %s ...\n", model_path.c_str());
     rt.m.load(model_path);
     const HParams& hp = rt.m.hp;
