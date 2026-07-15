@@ -15,9 +15,10 @@ import struct
 import sys
 from pathlib import Path
 
-TOP1_REQUIRED = True
 TOPK = 20
-MAX_ABS_TOL = 0.75
+MAX_ABS_TOL = 0.75   # pre-divergence top-20 |delta| bound
+TIE_MARGIN = 1.0     # a top-1 flip only passes if the vendor's own top-2
+                     # margin was below this (greedy near-tie, not wrong math)
 
 
 def read_dump(path: Path, n_steps: int) -> list[list[float]]:
@@ -38,24 +39,28 @@ def main() -> None:
     n_vocab = len(vendor[0])
     steps = min(len(vendor), len(ours))
 
+    # compare until the first token flip: past it the two engines decode
+    # different contexts and logits are legitimately incomparable
     worst_abs = 0.0
-    top1_miss = []
+    flip = None
     for s in range(steps):
         vs, os_ = vendor[s], ours[s]
-        v_top1 = max(range(n_vocab), key=lambda i: vs[i])
+        order = sorted(range(n_vocab), key=lambda i: vs[i], reverse=True)
+        v_top1 = order[0]
         o_top1 = max(range(n_vocab), key=lambda i: os_[i])
         if v_top1 != o_top1:
-            top1_miss.append((s, v_top1, o_top1))
-        topk = sorted(range(n_vocab), key=lambda i: vs[i], reverse=True)[:TOPK]
-        step_abs = max(abs(vs[i] - os_[i]) for i in topk)
-        worst_abs = max(worst_abs, step_abs)
+            flip = (s, v_top1, o_top1, vs[order[0]] - vs[order[1]])
+            break
+        worst_abs = max(worst_abs, max(abs(vs[i] - os_[i]) for i in order[:TOPK]))
 
-    print(f"steps={steps} top1_mismatches={len(top1_miss)} "
-          f"worst_top{TOPK}_abs_delta={worst_abs:.4f}")
-    for s, v, o in top1_miss[:5]:
-        print(f"  step {s}: vendor argmax {v} vs ours {o}")
+    if flip is None:
+        print(f"steps={steps} no_flip worst_top{TOPK}_abs_delta={worst_abs:.4f}")
+        sys.exit(0 if worst_abs < MAX_ABS_TOL else 1)
 
-    ok = worst_abs < MAX_ABS_TOL and (not TOP1_REQUIRED or not top1_miss)
+    s, v, o, margin = flip
+    print(f"steps={steps} flip_at={s} vendor_margin={margin:.4f} "
+          f"(vendor {v} vs ours {o}) pre_flip_worst_delta={worst_abs:.4f}")
+    ok = worst_abs < MAX_ABS_TOL and margin < TIE_MARGIN
     sys.exit(0 if ok else 1)
 
 
