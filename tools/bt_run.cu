@@ -518,6 +518,46 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
                              "mega probe: ||x||=%.4f a8_nz=%d/256 y32[0..3]=%g %g %g %g "
                              "tok=%d\n",
                              std::sqrt(ss), nz, hy[0], hy[1], hy[2], hy[3], tok);
+                if (rt.mp.ts) {
+                    int cnt = 0;
+                    CUDA_CHECK(cudaMemcpy(&cnt, rt.d_ts_count, 4, cudaMemcpyDeviceToHost));
+                    std::vector<unsigned long long> ts((size_t)cnt);
+                    CUDA_CHECK(cudaMemcpy(ts.data(), rt.d_ts, (size_t)cnt * 8,
+                                          cudaMemcpyDeviceToHost));
+                    // stamp layout: pre_embed, post_embed, 8 per layer, head, argmax
+                    static const char* names[8] = {"proj",      "conv|prep", "gdn|attn",
+                                                   "gatequant", "out_proj",  "gate_up",
+                                                   "swiglu",    "down"};
+                    double sums[8] = {0};
+                    const double embed_c = cnt > 1 ? (double)(ts[1] - ts[0]) : 0;
+                    const int layers = (cnt - 4) / 8;
+                    for (int L = 0; L < layers; ++L) {
+                        for (int ph = 0; ph < 8; ++ph) {
+                            const int i = 2 + L * 8 + ph;
+                            sums[ph] += (double)(ts[i] - ts[i - 1]);
+                        }
+                    }
+                    double head_c = 0, amax_c = 0;
+                    if (cnt >= 4 + layers * 8) {
+                        head_c = (double)(ts[2 + layers * 8] - ts[1 + layers * 8]);
+                        amax_c = (double)(ts[3 + layers * 8] - ts[2 + layers * 8]);
+                    }
+                    const double mhz = 1980.0;  // approx SM clock; shares are exact
+                    std::fprintf(stderr, "mega phases (%d stamps, %d layers):\n", cnt,
+                                 layers);
+                    std::fprintf(stderr, "  embed     %8.1f us\n", embed_c / mhz);
+                    double total = embed_c;
+                    for (int ph = 0; ph < 8; ++ph) {
+                        total += sums[ph];
+                        std::fprintf(stderr, "  %-9s %8.1f us total (%5.2f us/layer)\n",
+                                     names[ph], sums[ph] / mhz, sums[ph] / mhz / layers);
+                    }
+                    total += head_c + amax_c;
+                    std::fprintf(stderr,
+                                 "  lm_head   %8.1f us\n  argmax    %8.1f us\n"
+                                 "  SUM       %8.1f us\n",
+                                 head_c / mhz, amax_c / mhz, total / mhz);
+                }
             }
         }
         // bump advanced d_step during the prompt; generation records from 0.
