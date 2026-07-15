@@ -162,9 +162,26 @@ struct Runtime {
         }
     }
 
-    void mv_f16out(const Mat& mat, const __half* src, float* scratch32, __half* out16) {
-        mv16(mat, src, scratch32);
-        f32_to_f16_launch(scratch32, out16, mat.M, st);
+    void check_quant(const Mat& mat) {
+        if (mat.nbits == 16 || quant_k != mat.K) {
+            std::fprintf(stderr, "fused epilogue needs quant mat, K %d vs %d\n",
+                         quant_k, mat.K);
+            std::exit(1);
+        }
+    }
+
+    // projection: GEMV writing f16 directly (cast fused into the epilogue)
+    void mv_f16(const Mat& mat, __half* y16) {
+        check_quant(mat);
+        gemv_f16out_launch(mat.nbits, mat.codes, mat.scales, a8, a_scale, a_gsum,
+                           y16, mat.M, mat.K, st);
+    }
+
+    // output projection: GEMV accumulating into the fp32 residual stream
+    void mv_add(const Mat& mat, float* xdst) {
+        check_quant(mat);
+        gemv_addinto_launch(mat.nbits, mat.codes, mat.scales, a8, a_scale, a_gsum,
+                            xdst, mat.M, mat.K, st);
     }
 };
 
@@ -182,9 +199,8 @@ void gdn_layer(Runtime& rt, int il) {
     rt.quant_k = hp.n_embd;
     probe_vec(rt, "attn_norm", il, rt.xn, hp.n_embd);
 
-    // fused [qkv_mixed | z | alpha | beta] projection: one GEMV, one cast
-    rt.mv16(l.gdn_fused, rt.xn, rt.y32);
-    f32_to_f16_launch(rt.y32, rt.big_a, l.gdn_fused.M, rt.st);
+    // fused [qkv_mixed | z | alpha | beta] projection, f16 epilogue
+    rt.mv_f16(l.gdn_fused, rt.big_a);
     __half* qkv_mixed = rt.big_a;
     __half* z = rt.big_a + l.ssm_in_rows;
     __half* alpha_raw = z + l.ssm_gate_rows;
@@ -215,8 +231,7 @@ void gdn_layer(Runtime& rt, int il) {
     rt.quant_k = hp.ssm_inner;
     probe_vec(rt, "final_output", il, rt.attn_out, hp.ssm_inner);
 
-    rt.mv16(l.ssm_out, rt.attn_out, rt.y32);
-    add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
+    rt.mv_add(l.ssm_out, rt.x);
 }
 
 void attn_layer(Runtime& rt, int il) {
@@ -228,9 +243,8 @@ void attn_layer(Runtime& rt, int il) {
                              rt.a_scale, rt.a_gsum, hp.rms_eps, rt.st);
     rt.quant_k = hp.n_embd;
 
-    // fused [q+gate | k | v] projection: one GEMV, one cast
-    rt.mv16(l.qkv_fused, rt.xn, rt.y32);
-    f32_to_f16_launch(rt.y32, rt.big_a, l.qkv_fused.M, rt.st);
+    // fused [q+gate | k | v] projection, f16 epilogue
+    rt.mv_f16(l.qkv_fused, rt.big_a);
     __half* qg = rt.big_a;                       // [H][2D] interleaved q|gate
     __half* kk = rt.big_a + l.wq_rows;
     __half* vv = kk + l.wk_rows;
@@ -267,8 +281,7 @@ void attn_layer(Runtime& rt, int il) {
     gate_mul_quant_launch(1, rt.attn_out, rt.big_b, H * D, rt.attn_out, rt.a8,
                           rt.a_scale, rt.a_gsum, rt.st);
     rt.quant_k = H * D;
-    rt.mv16(l.wo, rt.attn_out, rt.y32);
-    add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
+    rt.mv_add(l.wo, rt.x);
 }
 
 void mlp(Runtime& rt, int il) {
@@ -277,13 +290,11 @@ void mlp(Runtime& rt, int il) {
     rmsnorm_quant_f32_launch(rt.x, l.attn_post_norm, hp.n_embd, rt.xn, rt.a8,
                              rt.a_scale, rt.a_gsum, hp.rms_eps, rt.st);
     rt.quant_k = hp.n_embd;
-    rt.mv16(l.gate_up, rt.xn, rt.y32);
-    f32_to_f16_launch(rt.y32, rt.big_a, l.gate_up.M, rt.st);
+    rt.mv_f16(l.gate_up, rt.big_a);
     gate_mul_quant_launch(0, rt.big_a, rt.big_a + l.gate_rows, hp.n_ff, nullptr,
                           rt.a8, rt.a_scale, rt.a_gsum, rt.st);
     rt.quant_k = hp.n_ff;
-    rt.mv16(l.down, rt.big_a, rt.y32);
-    add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
+    rt.mv_add(l.down, rt.x);
 }
 
 // BT_PROBE=1: print ||x|| after embed and each layer (first decode step only)

@@ -64,15 +64,18 @@ __global__ void quant_acts_kernel(const __half* __restrict__ x, int K,
 //   Q2: chunk = 64 codes  = half a group  -> correction gsum64[chunk]
 //   Q1: chunk = 128 codes = a full group  -> correction gsum64[2c] + gsum64[2c+1]
 // blockIdx.y splits the K range so small-M shapes still fill the GPU; splits
-// stage only their activation slice and combine partial sums with atomicAdd
-// (y must be zeroed first — gemv_launch handles it).
-template <int NBITS, bool SPLIT>
+// stage only their activation slice and combine partial sums with atomicAdd.
+// EPI selects the epilogue: 0 = store f32 into y, 1 = store f16 into y16
+// (single split only), 2 = accumulate into y (residual add fused in; split
+// partials atomicAdd directly onto the destination — no zeroing needed).
+template <int NBITS, bool SPLIT, int EPI>
 __global__ void gemv_kernel(const uint8_t* __restrict__ codes,
                             const __half* __restrict__ w_scale,
                             const int8_t* __restrict__ a8,
                             const float* __restrict__ a_scale,
                             const int32_t* __restrict__ a_gsum64,
-                            float* __restrict__ y, int M, int K) {
+                            float* __restrict__ y, __half* __restrict__ y16,
+                            int M, int K) {
     constexpr int kCodesPerChunk = NBITS == 2 ? 64 : 128;
     const int code_row_bytes = NBITS == 2 ? (K >> 2) : (K >> 3);
     const int chunks = code_row_bytes / 16;
@@ -180,10 +183,20 @@ __global__ void gemv_kernel(const uint8_t* __restrict__ codes,
             acc[r] += __shfl_down_sync(0xFFFFFFFFu, acc[r], off);
         }
         if (lane == 0 && r < nrows) {
-            if constexpr (SPLIT) {
-                atomicAdd(&y[row0 + r], acc[r]);
+            if constexpr (EPI == 1) {
+                y16[row0 + r] = __float2half(acc[r]);
+            } else if constexpr (EPI == 2) {
+                if constexpr (SPLIT) {
+                    atomicAdd(&y[row0 + r], acc[r]);
+                } else {
+                    y[row0 + r] += acc[r];
+                }
             } else {
-                y[row0 + r] = acc[r];
+                if constexpr (SPLIT) {
+                    atomicAdd(&y[row0 + r], acc[r]);
+                } else {
+                    y[row0 + r] = acc[r];
+                }
             }
         }
     }
@@ -273,33 +286,91 @@ void quant_acts_launch(const __half* x, int K, int8_t* a8, float* a_scale,
     quant_acts_kernel<<<blocks, warps_per_block * 32, 0, stream>>>(x, K, a8, a_scale, a_gsum64);
 }
 
-void gemv_launch(int nbits, const uint8_t* codes, const __half* w_scale,
-                 const int8_t* a8, const float* a_scale, const int32_t* a_gsum64,
-                 float* y, int M, int K, cudaStream_t stream) {
+namespace {
+
+struct GemvPlan {
+    dim3 grid;
+    int smem;
+    int splits;
+};
+
+GemvPlan plan_gemv(int nbits, int M, int K) {
     const int row_blocks = (M + 31) / 32;
     // fill the GPU: aim for ~1024 blocks, but keep >=32 chunks per split so
     // every lane of the chunk-striding warps has work; matrices with plenty of
-    // row blocks skip splitting entirely (memset+atomic overhead beats it)
+    // row blocks skip splitting entirely (atomic overhead beats it)
     const int chunks = (nbits == 2 ? K / 4 : K / 8) / 16;
     int splits = row_blocks >= 256 ? 1 : 1024 / row_blocks;
     splits = max(1, min(splits, chunks / 32));
     const int cps = ((chunks + splits - 1) / splits + 1) & ~1;
     const int a_slice = cps * (nbits == 2 ? 64 : 128);
-    const int smem = a_slice + (a_slice / 128) * 4 + (a_slice / 64) * 4;
+    return {dim3(row_blocks, splits), a_slice + (a_slice / 128) * 4 + (a_slice / 64) * 4,
+            splits};
+}
 
-    dim3 grid(row_blocks, splits);
-    if (splits > 1) {
+}  // namespace
+
+void gemv_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                 const int8_t* a8, const float* a_scale, const int32_t* a_gsum64,
+                 float* y, int M, int K, cudaStream_t stream) {
+    const GemvPlan p = plan_gemv(nbits, M, K);
+    if (p.splits > 1) {
         cudaMemsetAsync(y, 0, (size_t)M * 4, stream);
         if (nbits == 2) {
-            gemv_kernel<2, true><<<grid, 256, smem, stream>>>(codes, w_scale, a8, a_scale, a_gsum64, y, M, K);
+            gemv_kernel<2, true, 0><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, y, nullptr, M, K);
         } else {
-            gemv_kernel<1, true><<<grid, 256, smem, stream>>>(codes, w_scale, a8, a_scale, a_gsum64, y, M, K);
+            gemv_kernel<1, true, 0><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, y, nullptr, M, K);
         }
     } else {
         if (nbits == 2) {
-            gemv_kernel<2, false><<<grid, 256, smem, stream>>>(codes, w_scale, a8, a_scale, a_gsum64, y, M, K);
+            gemv_kernel<2, false, 0><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, y, nullptr, M, K);
         } else {
-            gemv_kernel<1, false><<<grid, 256, smem, stream>>>(codes, w_scale, a8, a_scale, a_gsum64, y, M, K);
+            gemv_kernel<1, false, 0><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, y, nullptr, M, K);
+        }
+    }
+}
+
+void gemv_f16out_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                        const int8_t* a8, const float* a_scale,
+                        const int32_t* a_gsum64, __half* y16, int M, int K,
+                        cudaStream_t stream) {
+    GemvPlan p = plan_gemv(nbits, M, K);
+    // f16 stores cannot combine split partials; force a single split (only
+    // used for the big fused projections, which never split anyway)
+    p.grid.y = 1;
+    if (nbits == 2) {
+        gemv_kernel<2, false, 1><<<p.grid, 256, p.smem, stream>>>(
+            codes, w_scale, a8, a_scale, a_gsum64, nullptr, y16, M, K);
+    } else {
+        gemv_kernel<1, false, 1><<<p.grid, 256, p.smem, stream>>>(
+            codes, w_scale, a8, a_scale, a_gsum64, nullptr, y16, M, K);
+    }
+}
+
+void gemv_addinto_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                         const int8_t* a8, const float* a_scale,
+                         const int32_t* a_gsum64, float* x, int M, int K,
+                         cudaStream_t stream) {
+    const GemvPlan p = plan_gemv(nbits, M, K);
+    if (p.splits > 1) {
+        if (nbits == 2) {
+            gemv_kernel<2, true, 2><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, x, nullptr, M, K);
+        } else {
+            gemv_kernel<1, true, 2><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, x, nullptr, M, K);
+        }
+    } else {
+        if (nbits == 2) {
+            gemv_kernel<2, false, 2><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, x, nullptr, M, K);
+        } else {
+            gemv_kernel<1, false, 2><<<p.grid, 256, p.smem, stream>>>(
+                codes, w_scale, a8, a_scale, a_gsum64, x, nullptr, M, K);
         }
     }
 }

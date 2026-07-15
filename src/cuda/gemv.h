@@ -19,6 +19,17 @@ void gemv_launch(int nbits, const uint8_t* codes, const __half* w_scale,
                  const int8_t* a8, const float* a_scale, const int32_t* a_gsum64,
                  float* y, int M, int K, cudaStream_t stream);
 
+// fused epilogues: write f16 directly (projections), or accumulate into the
+// fp32 residual stream (output projections) — removes the cast / add kernels
+void gemv_f16out_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                        const int8_t* a8, const float* a_scale,
+                        const int32_t* a_gsum64, __half* y16, int M, int K,
+                        cudaStream_t stream);
+void gemv_addinto_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                         const int8_t* a8, const float* a_scale,
+                         const int32_t* a_gsum64, float* x, int M, int K,
+                         cudaStream_t stream);
+
 // dequantize one row of a re-tiled tensor to f16 (embedding lookup)
 void dequant_row_launch(int nbits, const uint8_t* codes, const __half* w_scale,
                         int row, int K, __half* out, cudaStream_t stream);
