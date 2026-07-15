@@ -724,6 +724,11 @@ bool mega_decode_launch(const MegaParams& p, cudaStream_t stream) {
         cudaGetDevice(&dev);
         cudaDeviceProp prop{};
         cudaGetDeviceProperties(&prop, dev);
+        // opt into the max smem carveout so blocks/SM is bounded by threads
+        // (2048/256 = 8), not the 48KB default carveout (48/19 = 2). More
+        // resident blocks = more waves overlapping the latency-bound MLP GEMVs.
+        cudaFuncSetAttribute((const void*)mega_decode_kernel,
+                             cudaFuncAttributePreferredSharedMemoryCarveout, 100);
         int per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &per_sm, (const void*)mega_decode_kernel, 256, smem_bytes);
