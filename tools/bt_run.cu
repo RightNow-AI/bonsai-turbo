@@ -173,32 +173,42 @@ void gdn_layer(Runtime& rt, int il) {
     const int Sv = hp.head_v_dim, Hv = hp.ssm_dt_rank;
 
     rmsnorm_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
+    probe_vec(rt, "attn_norm", il, rt.xn, hp.n_embd);
     rt.quant(rt.xn, hp.n_embd);
 
     rt.mv_f16out(l.ssm_in, rt.xn, rt.y32, rt.big_a);
     rt.mv_f16out(l.ssm_gate, rt.xn, rt.y32, rt.big_b);
+    probe_vec(rt, "qkv_mixed", il, rt.big_a, rt.qkv_dim());
+    probe_vec(rt, "z", il, rt.big_b, hp.ssm_inner);
     __half* alpha_raw = rt.gdn_out;
     __half* beta_raw = rt.gdn_out + Hv;
     rt.mv_f16out(l.ssm_alpha, rt.xn, rt.y32, alpha_raw);
     rt.mv_f16out(l.ssm_beta, rt.xn, rt.y32, beta_raw);
+    probe_vec(rt, "alpha_raw", il, alpha_raw, Hv);
+    probe_vec(rt, "beta_raw", il, beta_raw, Hv);
 
     conv1d_step_launch(rt.big_a, l.conv_w, rt.conv_state[(size_t)il], rt.big_a,
                        rt.qkv_dim(), hp.ssm_conv, rt.st);
+    probe_vec(rt, "conv_output_silu", il, rt.big_a, rt.qkv_dim());
 
     __half* qc = rt.big_a;
     __half* kc = rt.big_a + (size_t)Sk * Hk;
     __half* vc = rt.big_a + (size_t)2 * Sk * Hk;
     l2norm_heads_launch(qc, qc, Hk, Sk, hp.rms_eps, rt.st);
     l2norm_heads_launch(kc, kc, Hk, Sk, hp.rms_eps, rt.st);
+    probe_vec(rt, "q_conv_l2", il, qc, Sk * Hk);
 
     gdn_decode_launch(qc, kc, vc, alpha_raw, beta_raw, l.ssm_a, l.ssm_dt,
                       rt.gdn_state[(size_t)il], rt.attn_out, Hv, Hk, Sv, 1.0f, rt.st);
+    probe_vec(rt, "gdn_core_out", il, rt.attn_out, hp.ssm_inner);
 
     rmsnorm_heads_launch(rt.attn_out, l.ssm_norm, rt.attn_out, Hv, Sv, hp.rms_eps, rt.st);
     silu_mul_launch(rt.big_b, rt.attn_out, rt.attn_out, hp.ssm_inner, rt.st);
+    probe_vec(rt, "final_output", il, rt.attn_out, hp.ssm_inner);
 
     rt.quant(rt.attn_out, hp.ssm_inner);
     rt.mv_f16out(l.ssm_out, rt.attn_out, rt.y32, rt.xn);
+    probe_vec(rt, "linear_attn_out", il, rt.xn, hp.n_embd);
     add_inplace_launch(rt.x, rt.xn, hp.n_embd, rt.st);
 }
 
@@ -264,20 +274,42 @@ void mlp(Runtime& rt, int il) {
 }
 
 // BT_PROBE=1: print ||x|| after embed and each layer (first decode step only)
+// BT_PROBE=2: additionally dump sub-layer tensor sums for layer 0 (matches the
+// vendor eval-callback's cb() names for direct comparison)
+int probe_level() {
+    static const int lvl = getenv("BT_PROBE") ? atoi(getenv("BT_PROBE")) : 0;
+    return lvl;
+}
+static int g_probe_done = 0;
+
+void probe_vec(Runtime& rt, const char* name, int il, const __half* ptr, int n) {
+    if (probe_level() < 2 || g_probe_done || il != 0) return;
+    std::vector<__half> h((size_t)n);
+    CUDA_CHECK(cudaStreamSynchronize(rt.st));
+    CUDA_CHECK(cudaMemcpy(h.data(), ptr, (size_t)n * 2, cudaMemcpyDeviceToHost));
+    double sum = 0;
+    for (__half v : h) sum += (double)__half2float(v);
+    std::fprintf(stderr, "probe2 %-20s sum = %+.6f  [%+.5f %+.5f %+.5f]\n", name,
+                 sum, __half2float(h[0]), __half2float(h[1]), __half2float(h[2]));
+}
+
 void probe(Runtime& rt, const char* tag, int il) {
-    static const bool on = getenv("BT_PROBE") != nullptr;
-    static int printed_steps = 0;
-    if (!on || printed_steps > 0) return;
+    if (!probe_level() || g_probe_done) return;
     if (il < 0 && std::strcmp(tag, "done") == 0) {
-        printed_steps++;
+        g_probe_done++;
         return;
     }
     std::vector<__half> h((size_t)rt.m.hp.n_embd);
     CUDA_CHECK(cudaStreamSynchronize(rt.st));
     CUDA_CHECK(cudaMemcpy(h.data(), rt.x, h.size() * 2, cudaMemcpyDeviceToHost));
-    double ss = 0;
-    for (__half v : h) ss += (double)__half2float(v) * __half2float(v);
-    std::fprintf(stderr, "probe %-8s %3d ||x|| = %.6f\n", tag, il, std::sqrt(ss));
+    double ss = 0, sum = 0;
+    for (__half v : h) {
+        const double f = __half2float(v);
+        ss += f * f;
+        sum += f;
+    }
+    std::fprintf(stderr, "probe %-8s %3d ||x|| = %.6f sum = %+.6f\n", tag, il,
+                 std::sqrt(ss), sum);
 }
 
 // layer stack + head; embed comes from host `token` (eager) or *d_tok (graph)
