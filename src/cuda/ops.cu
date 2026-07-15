@@ -53,6 +53,98 @@ __global__ void add_f32_kernel(float* __restrict__ x, const float* __restrict__ 
     if (i < n) x[i] += d[i];
 }
 
+// quantize 128-value groups held in shared memory; one warp per group stride.
+// Rounding matches quant_acts_kernel exactly (rn, clamp +/-127, gsum64 halves).
+__device__ void quant_groups_from_smem(const float* s_vals, int n, int8_t* a8,
+                                       float* a_scale, int32_t* a_gsum64) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int n_warps = blockDim.x / 32;
+    for (int g = warp; g < n / 128; g += n_warps) {
+        float amax = 0.f;
+        float vals[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            vals[i] = s_vals[g * 128 + lane * 4 + i];
+            amax = fmaxf(amax, fabsf(vals[i]));
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+        }
+        const float s = fmaxf(amax, 1e-8f) / 127.f;
+        const float inv_s = 1.f / s;
+        int lsum = 0;
+        char4 q;
+        int8_t* qp = reinterpret_cast<int8_t*>(&q);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int v = __float2int_rn(vals[i] * inv_s);
+            v = max(-127, min(127, v));
+            qp[i] = (int8_t)v;
+            lsum += v;
+        }
+        reinterpret_cast<char4*>(a8)[g * 32 + lane] = q;
+        const uint32_t half_mask = (lane < 16) ? 0x0000FFFFu : 0xFFFF0000u;
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) {
+            lsum += __shfl_down_sync(half_mask, lsum, off);
+        }
+        if ((lane & 15) == 0) a_gsum64[g * 2 + lane / 16] = lsum;
+        if (lane == 0) a_scale[g] = s;
+    }
+}
+
+// single block: rms reduce, then normalize into smem, then per-group quantize
+__global__ void rmsnorm_quant_f32_kernel(const float* __restrict__ x,
+                                         const __half* __restrict__ w, int n,
+                                         __half* __restrict__ y,
+                                         int8_t* __restrict__ a8,
+                                         float* __restrict__ a_scale,
+                                         int32_t* __restrict__ a_gsum64, float eps) {
+    extern __shared__ float s_vals[];
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    ss = block_reduce_sum(ss);
+    const float inv = rsqrtf(ss / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = x[i] * inv * __half2float(w[i]);
+        s_vals[i] = v;
+        if (y) y[i] = __float2half(v);
+    }
+    __syncthreads();
+    quant_groups_from_smem(s_vals, n, a8, a_scale, a_gsum64);
+}
+
+// grid over group tiles: op + quantize without any global reduce
+template <int OP>
+__global__ void gate_mul_quant_kernel(const __half* __restrict__ a,
+                                      const __half* __restrict__ b, int n,
+                                      __half* __restrict__ y,
+                                      int8_t* __restrict__ a8,
+                                      float* __restrict__ a_scale,
+                                      int32_t* __restrict__ a_gsum64) {
+    __shared__ float s_vals[1024];  // 8 groups per 256-thread block
+    const int base = blockIdx.x * 1024;
+    const int todo = min(1024, n - base);
+    for (int i = threadIdx.x; i < todo; i += blockDim.x) {
+        const float av = __half2float(a[base + i]);
+        const float bv = __half2float(b[base + i]);
+        float v;
+        if (OP == 0) {
+            v = av / (1.f + expf(-av)) * bv;  // silu(a) * b
+        } else {
+            v = av / (1.f + expf(-bv));       // a * sigmoid(b)
+        }
+        s_vals[i] = v;
+        if (y) y[base + i] = __float2half(v);
+    }
+    __syncthreads();
+    // groups within this tile
+    quant_groups_from_smem(s_vals, todo, a8 + base, a_scale + base / 128,
+                           a_gsum64 + base / 64);
+}
+
 // one block per head
 __global__ void rmsnorm_heads_kernel(const __half* __restrict__ x, const __half* __restrict__ w,
                                      __half* __restrict__ y, int d, float eps) {
@@ -319,6 +411,24 @@ void rmsnorm_f32_launch(const float* x, const __half* w, __half* y, int n, float
 
 void add_f32_launch(float* x, const float* d, int n, cudaStream_t stream) {
     add_f32_kernel<<<blocks_for(n), kThreads, 0, stream>>>(x, d, n);
+}
+
+void rmsnorm_quant_f32_launch(const float* x, const __half* w, int n, __half* y,
+                              int8_t* a8, float* a_scale, int32_t* a_gsum64,
+                              float eps, cudaStream_t stream) {
+    rmsnorm_quant_f32_kernel<<<1, 1024, (size_t)n * 4, stream>>>(x, w, n, y, a8,
+                                                                 a_scale, a_gsum64, eps);
+}
+
+void gate_mul_quant_launch(int op, const __half* a, const __half* b, int n,
+                           __half* y, int8_t* a8, float* a_scale,
+                           int32_t* a_gsum64, cudaStream_t stream) {
+    const int blocks = (n + 1023) / 1024;
+    if (op == 0) {
+        gate_mul_quant_kernel<0><<<blocks, 256, 0, stream>>>(a, b, n, y, a8, a_scale, a_gsum64);
+    } else {
+        gate_mul_quant_kernel<1><<<blocks, 256, 0, stream>>>(a, b, n, y, a8, a_scale, a_gsum64);
+    }
 }
 
 void rmsnorm_heads_launch(const __half* x, const __half* w, __half* y, int h, int d,

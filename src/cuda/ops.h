@@ -18,6 +18,18 @@ void rmsnorm_f32_launch(const float* x, const __half* w, __half* y, int n,
 // x[i] += d[i] (residual add straight from a GEMV's fp32 output)
 void add_f32_launch(float* x, const float* d, int n, cudaStream_t stream);
 
+// fused rmsnorm + int8 activation quantization (one launch instead of two):
+// y (f16 normalized copy) may be null when only the quantized form is needed
+void rmsnorm_quant_f32_launch(const float* x, const __half* w, int n, __half* y,
+                              int8_t* a8, float* a_scale, int32_t* a_gsum64,
+                              float eps, cudaStream_t stream);
+
+// fused elementwise-gate + int8 quantization: op 0: silu(a)*b, op 1: a*sigmoid(b)
+// y (f16 result copy) may be null
+void gate_mul_quant_launch(int op, const __half* a, const __half* b, int n,
+                           __half* y, int8_t* a8, float* a_scale,
+                           int32_t* a_gsum64, cudaStream_t stream);
+
 // per-head RMS norm: h vectors of length d, same weight w[d] for every head
 void rmsnorm_heads_launch(const __half* x, const __half* w, __half* y, int h,
                           int d, float eps, cudaStream_t stream);

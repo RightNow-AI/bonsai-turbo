@@ -177,9 +177,10 @@ void gdn_layer(Runtime& rt, int il) {
     const int Sk = hp.ssm_state, Hk = hp.ssm_groups;
     const int Sv = hp.head_v_dim, Hv = hp.ssm_dt_rank;
 
-    rmsnorm_f32_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
+    rmsnorm_quant_f32_launch(rt.x, l.attn_norm, hp.n_embd, rt.xn, rt.a8,
+                             rt.a_scale, rt.a_gsum, hp.rms_eps, rt.st);
+    rt.quant_k = hp.n_embd;
     probe_vec(rt, "attn_norm", il, rt.xn, hp.n_embd);
-    rt.quant(rt.xn, hp.n_embd);
 
     // fused [qkv_mixed | z | alpha | beta] projection: one GEMV, one cast
     rt.mv16(l.gdn_fused, rt.xn, rt.y32);
@@ -209,10 +210,11 @@ void gdn_layer(Runtime& rt, int il) {
     probe_vec(rt, "gdn_core_out", il, rt.attn_out, hp.ssm_inner);
 
     rmsnorm_heads_launch(rt.attn_out, l.ssm_norm, rt.attn_out, Hv, Sv, hp.rms_eps, rt.st);
-    silu_mul_launch(z, rt.attn_out, rt.attn_out, hp.ssm_inner, rt.st);
+    gate_mul_quant_launch(0, z, rt.attn_out, hp.ssm_inner, rt.attn_out, rt.a8,
+                          rt.a_scale, rt.a_gsum, rt.st);
+    rt.quant_k = hp.ssm_inner;
     probe_vec(rt, "final_output", il, rt.attn_out, hp.ssm_inner);
 
-    rt.quant(rt.attn_out, hp.ssm_inner);
     rt.mv16(l.ssm_out, rt.attn_out, rt.y32);
     add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
 }
@@ -222,8 +224,9 @@ void attn_layer(Runtime& rt, int il) {
     const Layer& l = rt.m.layers[(size_t)il];
     const int D = hp.head_dim, H = hp.n_head, Hkv = hp.n_head_kv;
 
-    rmsnorm_f32_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
-    rt.quant(rt.xn, hp.n_embd);
+    rmsnorm_quant_f32_launch(rt.x, l.attn_norm, hp.n_embd, rt.xn, rt.a8,
+                             rt.a_scale, rt.a_gsum, hp.rms_eps, rt.st);
+    rt.quant_k = hp.n_embd;
 
     // fused [q+gate | k | v] projection: one GEMV, one cast
     rt.mv16(l.qkv_fused, rt.xn, rt.y32);
@@ -261,9 +264,9 @@ void attn_layer(Runtime& rt, int il) {
                            1.f / sqrtf((float)D), rt.st);
     }
 
-    sigmoid_mul_launch(rt.attn_out, rt.big_b, rt.attn_out, H * D, rt.st);
-
-    rt.quant(rt.attn_out, H * D);
+    gate_mul_quant_launch(1, rt.attn_out, rt.big_b, H * D, rt.attn_out, rt.a8,
+                          rt.a_scale, rt.a_gsum, rt.st);
+    rt.quant_k = H * D;
     rt.mv16(l.wo, rt.attn_out, rt.y32);
     add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
 }
@@ -271,12 +274,14 @@ void attn_layer(Runtime& rt, int il) {
 void mlp(Runtime& rt, int il) {
     const HParams& hp = rt.m.hp;
     const Layer& l = rt.m.layers[(size_t)il];
-    rmsnorm_f32_launch(rt.x, l.attn_post_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
-    rt.quant(rt.xn, hp.n_embd);
+    rmsnorm_quant_f32_launch(rt.x, l.attn_post_norm, hp.n_embd, rt.xn, rt.a8,
+                             rt.a_scale, rt.a_gsum, hp.rms_eps, rt.st);
+    rt.quant_k = hp.n_embd;
     rt.mv16(l.gate_up, rt.xn, rt.y32);
     f32_to_f16_launch(rt.y32, rt.big_a, l.gate_up.M, rt.st);
-    silu_mul_launch(rt.big_a, rt.big_a + l.gate_rows, rt.big_a, hp.n_ff, rt.st);
-    rt.quant(rt.big_a, hp.n_ff);
+    gate_mul_quant_launch(0, rt.big_a, rt.big_a + l.gate_rows, hp.n_ff, nullptr,
+                          rt.a8, rt.a_scale, rt.a_gsum, rt.st);
+    rt.quant_k = hp.n_ff;
     rt.mv16(l.down, rt.big_a, rt.y32);
     add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
 }
@@ -344,8 +349,9 @@ void decode_body(Runtime& rt, int token) {
         probe(rt, "mlp", il);
     }
     probe(rt, "done", -1);
-    rmsnorm_f32_launch(rt.x, rt.m.output_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
-    rt.quant(rt.xn, hp.n_embd);
+    rmsnorm_quant_f32_launch(rt.x, rt.m.output_norm, hp.n_embd, rt.xn, rt.a8,
+                             rt.a_scale, rt.a_gsum, hp.rms_eps, rt.st);
+    rt.quant_k = hp.n_embd;
     rt.mv16(rt.m.lm_head, rt.xn, rt.y32);
 }
 
