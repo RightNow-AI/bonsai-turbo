@@ -263,6 +263,23 @@ void mlp(Runtime& rt, int il) {
     add_inplace_launch(rt.x, rt.xn, hp.n_embd, rt.st);
 }
 
+// BT_PROBE=1: print ||x|| after embed and each layer (first decode step only)
+void probe(Runtime& rt, const char* tag, int il) {
+    static const bool on = getenv("BT_PROBE") != nullptr;
+    static int printed_steps = 0;
+    if (!on || printed_steps > 0) return;
+    if (il < 0 && std::strcmp(tag, "done") == 0) {
+        printed_steps++;
+        return;
+    }
+    std::vector<__half> h((size_t)rt.m.hp.n_embd);
+    CUDA_CHECK(cudaStreamSynchronize(rt.st));
+    CUDA_CHECK(cudaMemcpy(h.data(), rt.x, h.size() * 2, cudaMemcpyDeviceToHost));
+    double ss = 0;
+    for (__half v : h) ss += (double)__half2float(v) * __half2float(v);
+    std::fprintf(stderr, "probe %-8s %3d ||x|| = %.6f\n", tag, il, std::sqrt(ss));
+}
+
 // layer stack + head; embed comes from host `token` (eager) or *d_tok (graph)
 void decode_body(Runtime& rt, int token) {
     const HParams& hp = rt.m.hp;
@@ -279,14 +296,19 @@ void decode_body(Runtime& rt, int token) {
         dequant_row_launch(rt.m.tok_embd.nbits, rt.m.tok_embd.codes,
                            rt.m.tok_embd.scales, token, hp.n_embd, rt.x, rt.st);
     }
+    probe(rt, "embed", -1);
     for (int il = 0; il < hp.n_layer; ++il) {
         if (rt.m.layers[(size_t)il].recurrent) {
             gdn_layer(rt, il);
+            probe(rt, "gdn", il);
         } else {
             attn_layer(rt, il);
+            probe(rt, "attn", il);
         }
         mlp(rt, il);
+        probe(rt, "mlp", il);
     }
+    probe(rt, "done", -1);
     rmsnorm_launch(rt.x, rt.m.output_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
     rt.quant(rt.xn, hp.n_embd);
     rt.mv16(rt.m.lm_head, rt.xn, rt.y32);
