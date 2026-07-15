@@ -6,6 +6,7 @@
 #
 # Env overrides: FORK_DIR, WEIGHTS_DIR, OUT_DIR, BENCH_REPS
 set -uo pipefail
+FAILURES=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK_DIR="${FORK_DIR:-$ROOT/third_party/llama.cpp-prismml}"
@@ -32,6 +33,7 @@ run_bench () {
         > "$OUT_DIR/bench_${tag}.json" 2> "$OUT_DIR/bench_${tag}.stderr"; then
         echo "!! bench $tag FAILED; stderr tail:"
         tail -5 "$OUT_DIR/bench_${tag}.stderr"
+        FAILURES=$((FAILURES + 1))
         return 0
     fi
     python3 - "$OUT_DIR/bench_${tag}.json" "$tag" <<'PY'
@@ -52,3 +54,7 @@ run_bench "$TERNARY" ternary_kvq4 -ctk q4_0 -ctv q4_0
 run_bench "$ONEBIT"  onebit_kvq4 -ctk q4_0 -ctv q4_0
 
 echo "== raw results in $OUT_DIR"
+if [ "$FAILURES" -gt 0 ]; then
+    echo "!! $FAILURES bench run(s) failed"
+    exit 1
+fi

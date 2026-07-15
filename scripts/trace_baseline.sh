@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Per-token decode profile of the vendor fork: kernel executions per token and
-# GPU busy fraction, via an in-process CUPTI shim (no profiler daemon — works
-# in unprivileged containers where nsys stalls).
+# Decode profile of the vendor fork. Two observables:
+#   - ops per decode graph, read from the fork's own "graph nodes = N" log line
+#   - NVML utilization sampled at 100 ms during a long tg run (fraction of
+#     time a kernel was resident on the GPU)
+# GPU-side profilers (nsys, CUPTI) are blocked on most cloud runners, so this
+# uses only the fork's logs and nvidia-smi. Works on any Linux machine.
 #
-# Method: run the identical prompt with -n 8 and -n 40 generated tokens; every
-# counter is differenced between runs, so load/warmup/prompt costs cancel and
-# what remains is steady-state per-token decode cost.
-# Works on any Linux box with an NVIDIA GPU + CUDA toolkit; no cloud dependency.
-#
-# Env overrides: FORK_DIR, WEIGHTS_DIR, OUT_DIR, TRACE_MODEL, TRACE_N_HI
+# Env overrides: FORK_DIR, WEIGHTS_DIR, OUT_DIR, TRACE_MODEL, TRACE_N
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK_DIR="${FORK_DIR:-$ROOT/third_party/llama.cpp-prismml}"
 WEIGHTS_DIR="${WEIGHTS_DIR:-$ROOT/weights}"
 OUT_DIR="${OUT_DIR:-$ROOT/results/raw}"
-CLI="$FORK_DIR/build/bin/llama-cli"
+
 MODEL="${TRACE_MODEL:-$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf}"
 PROMPT="The roofline model of GPU performance says"
 mkdir -p "$OUT_DIR"

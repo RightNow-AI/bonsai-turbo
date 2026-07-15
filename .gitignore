@@ -14,5 +14,10 @@ __pycache__/
 *.pyc
 .venv/
 
-# raw bench dumps (curated summaries are committed under results/)
+# raw bench dumps (the curated results/summary.md is tracked)
 results/raw/
+
+# latex build junk
+*.aux
+*.log.tex
+docs/assets/*.pdf
