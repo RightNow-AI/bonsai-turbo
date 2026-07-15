@@ -81,7 +81,10 @@ def build_fork():
     # compile on local disk (fast), persist only build/bin (binaries + libs)
     out = _run_script("build_vendor_fork.sh", {"FORK_DIR": "/tmp/fork"})
     subprocess.run(
-        ["bash", "-c", "mkdir -p /data/fork/build && cp -a /tmp/fork/build/bin /data/fork/build/"],
+        ["bash", "-c",
+         "mkdir -p /data/fork/build && cp -a /tmp/fork/build/bin /data/fork/build/"
+         " && cp -a /tmp/fork/include /data/fork/"
+         " && mkdir -p /data/fork/ggml && cp -a /tmp/fork/ggml/include /data/fork/ggml/"],
         check=True,
     )
     data_vol.commit()

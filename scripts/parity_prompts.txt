@@ -1,0 +1,32 @@
+The roofline model of GPU performance says that
+In 1905, Albert Einstein published four papers that
+def fibonacci(n):
+SELECT name, COUNT(*) FROM orders GROUP BY
+The capital of Australia is
+Prove that the square root of 2 is irrational.
+Translate to French: "The weather is nice today."
+What is 17 * 23? Think step by step.
+Once upon a time, in a village by the sea,
+The mitochondria is the powerhouse of the cell because
+import torch
+List three differences between TCP and UDP.
+E = mc^2 means that
+Write a haiku about compilers.
+The fastest land animal is
+Explain quantum entanglement to a five year old.
+class BinarySearchTree:
+The French Revolution began in
+If x + 2y = 10 and x - y = 1, then x =
+Summarize the plot of Romeo and Juliet in one sentence.
+0x7f in decimal is
+The three laws of thermodynamics are
+He opened the ancient book and found
+Why is the sky blue?
+git rebase differs from git merge in that
+The chemical formula for table salt is
+A monad is a monoid in the category of
+Name the planets in order from the sun.
+To reverse a linked list in place,
+The derivative of sin(x) is
+She looked at the horizon and said, "
+The time complexity of quicksort in the worst case is

@@ -87,10 +87,53 @@ def microbench(shapes: str = "", gguf: str = "", tensor: str = "") -> str:
     return _sh(args)
 
 
+@app.function(image=cuda_dev_image, gpu="H100", volumes={"/data": data_vol}, timeout=3600)
+def parity(n_gen: int = 64, model: str = "ternary") -> str:
+    _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
+    _sh(["cmake", "--build", "/tmp/build", "-j"])
+    env = {
+        "FORK_DIR": "/data/fork",
+        "WEIGHTS_DIR": "/data/weights",
+        "OUT_DIR": "/tmp/parity_out",
+        "BT_BUILD": "/tmp/build",
+        "PARITY_MODEL": MODELS[model],
+        "N_GEN": str(n_gen),
+        "LD_LIBRARY_PATH": "/data/fork/build/bin",
+    }
+    import os
+
+    proc = subprocess.run(["bash", "/repo/scripts/parity.sh"],
+                          env={**os.environ, **env}, capture_output=True, text=True)
+    out = proc.stdout + ("\n--- stderr ---\n" + proc.stderr if proc.returncode else "")
+    print(out)
+    Path("/data/results").mkdir(exist_ok=True)
+    Path("/data/results/parity_summary.txt").write_text(out[-20000:])
+    data_vol.commit()
+    if proc.returncode:
+        raise RuntimeError(f"parity gate failed ({proc.returncode})")
+    return out
+
+
+@app.function(image=cuda_dev_image, gpu="H100", volumes={"/data": data_vol}, timeout=1800)
+def speed(n_gen: int = 128, model: str = "ternary") -> str:
+    _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
+    _sh(["cmake", "--build", "/tmp/build", "-j"])
+    # tg128-comparable: short fixed prompt, time n_gen greedy decode steps
+    return _sh(["/tmp/build/bt-run", "--model", MODELS[model],
+                "--ids", "785,9426,1614,315,22670,5068,2727,429", "--n", str(n_gen),
+                "--bench"])
+
+
 @app.local_entrypoint()
 def main(inspect: str = "", scan: bool = False, gpu: bool = False,
-         shapes: str = "", gguf: str = "", tensor: str = ""):
-    if gpu:
+         shapes: str = "", gguf: str = "", tensor: str = "",
+         run_parity: bool = False, run_speed: bool = False,
+         n_gen: int = 64, model: str = "ternary"):
+    if run_parity:
+        print(parity.remote(n_gen=n_gen, model=model))
+    elif run_speed:
+        print(speed.remote(n_gen=max(n_gen, 128), model=model))
+    elif gpu:
         print(microbench.remote(shapes=shapes, gguf=gguf, tensor=tensor))
     else:
         print(build_test.remote(inspect=inspect, scan=scan))

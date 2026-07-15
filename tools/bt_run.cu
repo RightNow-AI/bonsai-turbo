@@ -112,6 +112,20 @@ struct Runtime {
         quant_k = K;
     }
 
+    void reset_sequence() {
+        const HParams& hp = m.hp;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            if (m.layers[(size_t)il].recurrent) {
+                CUDA_CHECK(cudaMemset(gdn_state[(size_t)il], 0,
+                                      (size_t)hp.ssm_dt_rank * hp.head_v_dim *
+                                          hp.head_v_dim * 4));
+                CUDA_CHECK(cudaMemset(conv_state[(size_t)il], 0,
+                                      (size_t)hp.conv_channels * (hp.ssm_conv - 1) * 4));
+            }
+        }
+        pos = 0;  // attn caches need no clear: reads cover [0, pos) only
+    }
+
     // y32 <- mat @ (currently quantized activation); f16 result optionally
     void mv(const Mat& mat, float* out32) {
         if (mat.nbits == 16) {
@@ -267,47 +281,18 @@ std::vector<int> parse_ids(const std::string& s) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    std::string model_path, ids_str, logits_out;
-    int n_gen = 32;
-    bool bench = false;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--model" && i + 1 < argc) model_path = argv[++i];
-        else if (a == "--ids" && i + 1 < argc) ids_str = argv[++i];
-        else if (a == "--n" && i + 1 < argc) n_gen = std::atoi(argv[++i]);
-        else if (a == "--logits-out" && i + 1 < argc) logits_out = argv[++i];
-        else if (a == "--bench") bench = true;
-    }
-    if (model_path.empty() || ids_str.empty()) {
-        std::fprintf(stderr,
-                     "usage: bt-run --model X.gguf --ids 1,2,3 [--n 64] "
-                     "[--logits-out f.bin] [--bench]\n");
-        return 2;
-    }
-
-    Runtime rt;
-    std::fprintf(stderr, "loading %s ...\n", model_path.c_str());
-    rt.m.load(model_path);
+// one prompt: feed ids, generate n_gen greedy tokens, optionally dump logits
+void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
+                const std::string& logits_path, bool bench) {
     const HParams& hp = rt.m.hp;
-    std::fprintf(stderr,
-                 "arch ok: %d layers (%d attn), n_embd %d, heads %d/%d x %d, "
-                 "ff %d, vocab %d, gdn: Hk %d Sk %d Hv %d Sv %d conv %d(k)x%d(C)\n",
-                 hp.n_layer,
-                 (int)std::count(hp.recurrent.begin(), hp.recurrent.end(), 0),
-                 hp.n_embd, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_ff, hp.vocab,
-                 hp.ssm_groups, hp.ssm_state, hp.ssm_dt_rank, hp.head_v_dim,
-                 hp.ssm_conv, hp.conv_channels);
-    rt.alloc();
-
-    const std::vector<int> prompt = parse_ids(ids_str);
-    FILE* lf = logits_out.empty() ? nullptr : std::fopen(logits_out.c_str(), "wb");
+    rt.reset_sequence();
+    FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
     std::vector<float> logits((size_t)hp.vocab);
 
     for (int id : prompt) decode(rt, id);
 
-    int32_t* d_tok;
-    CUDA_CHECK(cudaMalloc(&d_tok, 4));
+    static int32_t* d_tok = nullptr;
+    if (!d_tok) CUDA_CHECK(cudaMalloc(&d_tok, 4));
 
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
@@ -337,7 +322,66 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
         std::printf("decode: %d tokens in %.1f ms = %.2f tok/s%s\n", n_gen, ms,
                     1000.f * n_gen / ms,
-                    logits_out.empty() ? "" : " (WARNING: includes logit dumps)");
+                    logits_path.empty() ? "" : " (WARNING: includes logit dumps)");
     }
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+}
+
+int main(int argc, char** argv) {
+    std::string model_path, ids_str, ids_file, logits_out;
+    int n_gen = 32;
+    bool bench = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--model" && i + 1 < argc) model_path = argv[++i];
+        else if (a == "--ids" && i + 1 < argc) ids_str = argv[++i];
+        else if (a == "--ids-file" && i + 1 < argc) ids_file = argv[++i];
+        else if (a == "--n" && i + 1 < argc) n_gen = std::atoi(argv[++i]);
+        else if (a == "--logits-out" && i + 1 < argc) logits_out = argv[++i];
+        else if (a == "--bench") bench = true;
+    }
+    if (model_path.empty() || (ids_str.empty() && ids_file.empty())) {
+        std::fprintf(stderr,
+                     "usage: bt-run --model X.gguf (--ids 1,2,3 | --ids-file f) "
+                     "[--n 64] [--logits-out prefix] [--bench]\n");
+        return 2;
+    }
+
+    Runtime rt;
+    std::fprintf(stderr, "loading %s ...\n", model_path.c_str());
+    rt.m.load(model_path);
+    const HParams& hp = rt.m.hp;
+    std::fprintf(stderr,
+                 "arch ok: %d layers (%d attn), n_embd %d, heads %d/%d x %d, "
+                 "ff %d, vocab %d, gdn: Hk %d Sk %d Hv %d Sv %d conv %d(k)x%d(C)\n",
+                 hp.n_layer,
+                 (int)std::count(hp.recurrent.begin(), hp.recurrent.end(), (uint8_t)0),
+                 hp.n_embd, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_ff, hp.vocab,
+                 hp.ssm_groups, hp.ssm_state, hp.ssm_dt_rank, hp.head_v_dim,
+                 hp.ssm_conv, hp.conv_channels);
+    rt.alloc();
+
+    if (!ids_str.empty()) {
+        run_prompt(rt, parse_ids(ids_str), n_gen, logits_out, bench);
+        return 0;
+    }
+
+    FILE* f = std::fopen(ids_file.c_str(), "r");
+    if (!f) {
+        std::fprintf(stderr, "cannot open %s\n", ids_file.c_str());
+        return 1;
+    }
+    char line[65536];
+    int idx = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        const std::vector<int> ids = parse_ids(line);
+        if (ids.empty()) continue;
+        const std::string lp =
+            logits_out.empty() ? "" : logits_out + "." + std::to_string(idx) + ".bin";
+        run_prompt(rt, ids, n_gen, lp, bench);
+        ++idx;
+    }
+    std::fclose(f);
     return 0;
 }
