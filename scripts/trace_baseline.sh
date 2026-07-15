@@ -20,10 +20,6 @@ MODEL="${TRACE_MODEL:-$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf}"
 PROMPT="The roofline model of GPU performance says"
 mkdir -p "$OUT_DIR"
 
-SHIM="$OUT_DIR/launch_counter.so"
-echo "== building launch counter"
-gcc -shared -fPIC "$ROOT/tools/launch_counter.c" -ldl -o "$SHIM"
-
 # network/FUSE-mounted weights are slow to load repeatedly; stage locally
 if [ "${TRACE_STAGE_LOCAL:-0}" = "1" ]; then
     echo "== staging model to local disk"
@@ -31,24 +27,21 @@ if [ "${TRACE_STAGE_LOCAL:-0}" = "1" ]; then
     MODEL=/tmp/trace-model.gguf
 fi
 
-N_LO=8
-N_HI="${TRACE_N_HI:-40}"
+# GPU-side profiling (nsys/CUPTI) is administratively blocked on most cloud
+# runners and ggml's static CUDA runtime defeats LD_PRELOAD interposition, so
+# the honest observables are:
+#   - ops per decode graph, from the fork's own "graph nodes = N" log line
+#     (>= kernel launches per token; CUDA graphs amortize the CPU-side cost)
+#   - NVML utilization.gpu sampled during a long tg run = fraction of time a
+#     kernel was resident = 1 - idle-between-kernels
 BENCH="$FORK_DIR/build/bin/llama-bench"
-for N in "$N_LO" "$N_HI"; do
-    echo "== profiled run: n=$N decode tokens (llama-bench, tg only)"
-    if [ "$N" = "$N_HI" ]; then
-        # sample SM utilization during the long run: NVML "utilization.gpu" is
-        # the fraction of time a kernel was resident = 1 - idle-between-launches
-        nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
-            --loop-ms=100 > "$OUT_DIR/smi_util.csv" &
-        SMI_PID=$!
-    fi
-    LAUNCH_COUNTER_OUT="$OUT_DIR/shim_n$N.json" LD_PRELOAD="$SHIM" \
-        timeout 900 "$BENCH" -m "$MODEL" -p 0 -n "$N" -r 1 -o json \
-        > "$OUT_DIR/bench_trace_n$N.json" 2> "$OUT_DIR/bench_trace_n$N.stderr"
-    if [ "$N" = "$N_HI" ]; then
-        kill "$SMI_PID" 2>/dev/null || true
-    fi
-done
+N="${TRACE_N:-512}"
+echo "== profiled run: tg $N with NVML sampling"
+nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
+    --loop-ms=100 > "$OUT_DIR/smi_util.csv" &
+SMI_PID=$!
+timeout 900 "$BENCH" -m "$MODEL" -p 0 -n "$N" -r 1 -o json -v \
+    > "$OUT_DIR/bench_trace.json" 2> "$OUT_DIR/bench_trace.stderr"
+kill "$SMI_PID" 2>/dev/null || true
 
-python3 "$ROOT/scripts/analyze_trace.py" "$OUT_DIR" "$N_LO" "$N_HI" | tee "$OUT_DIR/trace_summary.json"
+python3 "$ROOT/scripts/analyze_trace.py" "$OUT_DIR" | tee "$OUT_DIR/trace_summary.json"
