@@ -74,7 +74,7 @@ def build_test(inspect: str = "", scan: bool = False) -> str:
     return "\n".join(report)
 
 
-@app.function(image=cuda_dev_image, gpu="H100", volumes={"/data": data_vol}, timeout=1200)
+@app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol}, timeout=1200)
 def microbench(shapes: str = "", gguf: str = "", tensor: str = "") -> str:
     _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
     _sh(["cmake", "--build", "/tmp/build", "-j"])
@@ -87,7 +87,7 @@ def microbench(shapes: str = "", gguf: str = "", tensor: str = "") -> str:
     return _sh(args)
 
 
-@app.function(image=cuda_dev_image, gpu="H100", volumes={"/data": data_vol}, timeout=3600)
+@app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol}, timeout=3600)
 def parity(n_gen: int = 64, model: str = "ternary") -> str:
     _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
     _sh(["cmake", "--build", "/tmp/build", "-j"])
@@ -114,7 +114,7 @@ def parity(n_gen: int = 64, model: str = "ternary") -> str:
     return out
 
 
-@app.function(image=cuda_dev_image, gpu="H100", volumes={"/data": data_vol}, timeout=1800)
+@app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol}, timeout=1800)
 def speed(n_gen: int = 128, model: str = "ternary") -> str:
     _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
     _sh(["cmake", "--build", "/tmp/build", "-j"])

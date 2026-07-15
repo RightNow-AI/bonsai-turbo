@@ -36,6 +36,7 @@ RetiledTensor retile_q2_0(const BlockQ2_0* src, int64_t rows, int64_t cols) {
     t.codes.resize((size_t)(rows * cols / 4));
     t.scales.resize((size_t)(rows * blocks_per_row));
 
+#pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; ++r) {
         const BlockQ2_0* row = src + r * blocks_per_row;
         uint8_t* out_codes = t.codes.data() + r * (cols / 4);
@@ -67,6 +68,7 @@ RetiledTensor retile_q1_0(const BlockQ1_0* src, int64_t rows, int64_t cols) {
     t.codes.resize((size_t)(rows * cols / 8));
     t.scales.resize((size_t)(rows * blocks_per_row));
 
+#pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; ++r) {
         const BlockQ1_0* row = src + r * blocks_per_row;
         uint8_t* out_codes = t.codes.data() + r * (cols / 8);

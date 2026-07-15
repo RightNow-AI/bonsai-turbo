@@ -14,6 +14,11 @@ add_library(bt_core
 )
 target_include_directories(bt_core PUBLIC src)
 
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(bt_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
 add_executable(bt-inspect tools/bt_inspect.cpp)
 target_link_libraries(bt-inspect PRIVATE bt_core)
 
