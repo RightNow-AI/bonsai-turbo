@@ -101,12 +101,15 @@ __global__ void f32_to_f16_kernel(const float* __restrict__ x, __half* __restric
 }
 
 // NeoX pairing: dims (i, i + rot/2) rotate by pos * base^(-2i/rot)
+// POS_PTR: read the position from device memory (CUDA-graph capturable)
+template <bool POS_PTR>
 __global__ void rope_neox_kernel(__half* __restrict__ x, int d, int rot, int pos,
-                                 float freq_base) {
+                                 const int32_t* __restrict__ d_pos, float freq_base) {
     __half* xh = x + (size_t)blockIdx.x * d;
+    const int p = POS_PTR ? *d_pos : pos;
     const int half_rot = rot / 2;
     for (int i = threadIdx.x; i < half_rot; i += blockDim.x) {
-        const float theta = pos * powf(freq_base, -2.f * i / rot);
+        const float theta = p * powf(freq_base, -2.f * i / rot);
         float c, s;
         sincosf(theta, &s, &c);  // accurate variant: logit parity beats speed here
         const float x0 = __half2float(xh[i]);
@@ -114,6 +117,32 @@ __global__ void rope_neox_kernel(__half* __restrict__ x, int d, int rot, int pos
         xh[i] = __float2half(x0 * c - x1 * s);
         xh[i + half_rot] = __float2half(x0 * s + x1 * c);
     }
+}
+
+__global__ void embed_lookup_dev_kernel(const __half* __restrict__ table,
+                                        const int32_t* __restrict__ d_tok, int n,
+                                        __half* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = table[(size_t)(*d_tok) * n + i];
+}
+
+__global__ void kv_append_dev_kernel(const __half* __restrict__ k,
+                                     const __half* __restrict__ v,
+                                     __half* __restrict__ k_cache,
+                                     __half* __restrict__ v_cache, int row_elems,
+                                     const int32_t* __restrict__ d_pos) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= row_elems) return;
+    const size_t base = (size_t)(*d_pos) * row_elems;
+    k_cache[base + i] = k[i];
+    v_cache[base + i] = v[i];
+}
+
+__global__ void step_bump_kernel(int32_t* d_pos, int32_t* d_step, int32_t* ring,
+                                 int cap, const int32_t* d_tok) {
+    ring[*d_step % cap] = *d_tok;
+    ++*d_step;
+    ++*d_pos;
 }
 
 __global__ void embed_lookup_kernel(const __half* __restrict__ table, int token, int n,
@@ -224,7 +253,29 @@ void f32_to_f16_launch(const float* x, __half* y, int n, cudaStream_t stream) {
 
 void rope_neox_launch(__half* x, int h, int d, int rot, int pos, float freq_base,
                       cudaStream_t stream) {
-    rope_neox_kernel<<<h, 128, 0, stream>>>(x, d, rot, pos, freq_base);
+    rope_neox_kernel<false><<<h, 128, 0, stream>>>(x, d, rot, pos, nullptr, freq_base);
+}
+
+void rope_neox_dev_launch(__half* x, int h, int d, int rot, const int32_t* d_pos,
+                          float freq_base, cudaStream_t stream) {
+    rope_neox_kernel<true><<<h, 128, 0, stream>>>(x, d, rot, 0, d_pos, freq_base);
+}
+
+void embed_lookup_dev_launch(const __half* table, const int32_t* d_tok, int n,
+                             __half* out, cudaStream_t stream) {
+    embed_lookup_dev_kernel<<<blocks_for(n), kThreads, 0, stream>>>(table, d_tok, n, out);
+}
+
+void kv_append_dev_launch(const __half* k, const __half* v, __half* k_cache,
+                          __half* v_cache, int row_elems, const int32_t* d_pos,
+                          cudaStream_t stream) {
+    kv_append_dev_kernel<<<blocks_for(row_elems), kThreads, 0, stream>>>(
+        k, v, k_cache, v_cache, row_elems, d_pos);
+}
+
+void step_bump_launch(int32_t* d_pos, int32_t* d_step, int32_t* ring, int cap,
+                      const int32_t* d_tok, cudaStream_t stream) {
+    step_bump_kernel<<<1, 1, 0, stream>>>(d_pos, d_step, ring, cap, d_tok);
 }
 
 void embed_lookup_launch(const __half* table, int token, int n, __half* out,

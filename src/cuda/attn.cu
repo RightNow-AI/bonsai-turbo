@@ -9,15 +9,18 @@ namespace {
 
 // One block (8 warps) per query head. Warps stride context positions keeping
 // per-warp online-softmax state; a final block pass merges the 8 partials.
-template <int D>
+// POS_PTR: context length = *d_pos + 1 read on device (CUDA-graph capturable)
+template <int D, bool POS_PTR = false>
 __global__ void attn_decode_kernel(const __half* __restrict__ q,
                                    const __half* __restrict__ k_cache,
                                    const __half* __restrict__ v_cache,
                                    __half* __restrict__ out, int H, int H_kv,
-                                   int ctx_len, float scale) {
+                                   int ctx_len, const int32_t* __restrict__ d_pos,
+                                   float scale) {
     constexpr int kWarps = 8;
     constexpr int kVecPerLane = D / 32;
 
+    if (POS_PTR) ctx_len = *d_pos + 1;
     const int h = blockIdx.x;
     const int hkv = h / (H / H_kv);
     const int warp = threadIdx.x / 32;
@@ -104,16 +107,39 @@ void attn_decode_launch(const __half* q, const __half* k_cache,
                         int D, int ctx_len, float scale, cudaStream_t stream) {
     switch (D) {
         case 64:
-            attn_decode_kernel<64><<<H, 256, 0, stream>>>(q, k_cache, v_cache, out, H,
-                                                          H_kv, ctx_len, scale);
+            attn_decode_kernel<64><<<H, 256, 0, stream>>>(
+                q, k_cache, v_cache, out, H, H_kv, ctx_len, nullptr, scale);
             break;
         case 128:
-            attn_decode_kernel<128><<<H, 256, 0, stream>>>(q, k_cache, v_cache, out, H,
-                                                           H_kv, ctx_len, scale);
+            attn_decode_kernel<128><<<H, 256, 0, stream>>>(
+                q, k_cache, v_cache, out, H, H_kv, ctx_len, nullptr, scale);
             break;
         case 256:
-            attn_decode_kernel<256><<<H, 256, 0, stream>>>(q, k_cache, v_cache, out, H,
-                                                           H_kv, ctx_len, scale);
+            attn_decode_kernel<256><<<H, 256, 0, stream>>>(
+                q, k_cache, v_cache, out, H, H_kv, ctx_len, nullptr, scale);
+            break;
+        default:
+            std::fprintf(stderr, "attn_decode: unsupported head dim %d\n", D);
+            std::abort();
+    }
+}
+
+void attn_decode_dev_launch(const __half* q, const __half* k_cache,
+                            const __half* v_cache, __half* out, int H, int H_kv,
+                            int D, const int32_t* d_pos, float scale,
+                            cudaStream_t stream) {
+    switch (D) {
+        case 64:
+            attn_decode_kernel<64, true><<<H, 256, 0, stream>>>(
+                q, k_cache, v_cache, out, H, H_kv, 0, d_pos, scale);
+            break;
+        case 128:
+            attn_decode_kernel<128, true><<<H, 256, 0, stream>>>(
+                q, k_cache, v_cache, out, H, H_kv, 0, d_pos, scale);
+            break;
+        case 256:
+            attn_decode_kernel<256, true><<<H, 256, 0, stream>>>(
+                q, k_cache, v_cache, out, H, H_kv, 0, d_pos, scale);
             break;
         default:
             std::fprintf(stderr, "attn_decode: unsupported head dim %d\n", D);

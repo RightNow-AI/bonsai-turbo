@@ -119,9 +119,14 @@ def speed(n_gen: int = 128, model: str = "ternary") -> str:
     _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
     _sh(["cmake", "--build", "/tmp/build", "-j"])
     # tg128-comparable: short fixed prompt, time n_gen greedy decode steps
-    return _sh(["/tmp/build/bt-run", "--model", MODELS[model],
-                "--ids", "785,9426,1614,315,22670,5068,2727,429", "--n", str(n_gen),
-                "--bench"])
+    ids = "785,9426,1614,315,22670,5068,2727,429"
+    out = ["== eager =="]
+    out.append(_sh(["/tmp/build/bt-run", "--model", MODELS[model],
+                    "--ids", ids, "--n", str(n_gen), "--bench"]))
+    out.append("== cuda graph ==")
+    out.append(_sh(["/tmp/build/bt-run", "--model", MODELS[model],
+                    "--ids", ids, "--n", str(n_gen), "--bench", "--graph"]))
+    return "\n".join(out)
 
 
 @app.local_entrypoint()

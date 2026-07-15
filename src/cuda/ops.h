@@ -45,6 +45,25 @@ void rope_neox_launch(__half* x, int h, int d, int rot, int pos,
 void embed_lookup_launch(const __half* table, int token, int n, __half* out,
                          cudaStream_t stream);
 
+// ---- CUDA-graph-capturable variants: control state lives on device ----
+
+// like rope_neox_launch but position read from *d_pos
+void rope_neox_dev_launch(__half* x, int h, int d, int rot, const int32_t* d_pos,
+                          float freq_base, cudaStream_t stream);
+
+// like embed_lookup_launch but token read from *d_tok
+void embed_lookup_dev_launch(const __half* table, const int32_t* d_tok, int n,
+                             __half* out, cudaStream_t stream);
+
+// append k,v ([H_kv*D] each, f16) into caches at position *d_pos
+void kv_append_dev_launch(const __half* k, const __half* v, __half* k_cache,
+                          __half* v_cache, int row_elems, const int32_t* d_pos,
+                          cudaStream_t stream);
+
+// ring[*d_step] = *d_tok; ++*d_step; ++*d_pos  (end-of-step bump)
+void step_bump_launch(int32_t* d_pos, int32_t* d_step, int32_t* ring, int cap,
+                      const int32_t* d_tok, cudaStream_t stream);
+
 // single-vector argmax (greedy sampling); out[0] = index
 void argmax_launch(const float* x, int n, int32_t* out, cudaStream_t stream);
 

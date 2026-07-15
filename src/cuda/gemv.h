@@ -23,4 +23,9 @@ void gemv_launch(int nbits, const uint8_t* codes, const __half* w_scale,
 void dequant_row_launch(int nbits, const uint8_t* codes, const __half* w_scale,
                         int row, int K, __half* out, cudaStream_t stream);
 
+// graph-capturable variant: row index read from *d_row
+void dequant_row_dev_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                            const int32_t* d_row, int K, __half* out,
+                            cudaStream_t stream);
+
 }  // namespace bt

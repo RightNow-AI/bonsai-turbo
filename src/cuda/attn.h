@@ -14,4 +14,10 @@ void attn_decode_launch(const __half* q, const __half* k_cache,
                         const __half* v_cache, __half* out, int H, int H_kv,
                         int D, int ctx_len, float scale, cudaStream_t stream);
 
+// graph-capturable variant: ctx_len = *d_pos + 1
+void attn_decode_dev_launch(const __half* q, const __half* k_cache,
+                            const __half* v_cache, __half* out, int H, int H_kv,
+                            int D, const int32_t* d_pos, float scale,
+                            cudaStream_t stream);
+
 }  // namespace bt
