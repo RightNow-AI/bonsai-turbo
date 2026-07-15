@@ -149,18 +149,16 @@ def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2")
     print("=== OURS ===")
     print(ours.stderr[-8000:])
 
-    vend = subprocess.run(
-        ["/data/fork/build/bin/llama-eval-callback", "-m", MODELS[model], "-p", prompt,
-         "-n", "1", "-ngl", "99", "-v"], env=env, capture_output=True, text=True)
-    text = vend.stdout + vend.stderr
-    keep = [l for l in text.splitlines()
-            if re.search(r"(attn_norm|qkv_mixed|^z|z-0|conv_output|final_output|"
-                         r"linear_attn_out|attn_residual|post_ffn|beta|a_softplus"
-                         r"|gate)-0", l)]
-    print("=== VENDOR (layer 0 matches) ===")
-    print("\n".join(keep[:250]))
-    print("=== VENDOR raw tail ===")
-    print(text[-3000:])
+    _sh(["bash", "-c",
+         "g++ -O2 -I/data/fork/include -I/data/fork/ggml/include "
+         "/repo/tools/vendor_probe.cpp -L/data/fork/build/bin -lllama -lggml "
+         "-lggml-base -Wl,-rpath,/data/fork/build/bin -o /tmp/vendor-probe"])
+    vend = subprocess.run(["/tmp/vendor-probe", MODELS[model], ids], env=env,
+                          capture_output=True, text=True)
+    print("=== VENDOR (layer 0) ===")
+    print("\n".join(l for l in vend.stdout.splitlines() if l.startswith("vprobe")))
+    if vend.returncode:
+        print("vendor-probe stderr tail:", vend.stderr[-1500:])
     return "done"
 
 
