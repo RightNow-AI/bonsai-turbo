@@ -131,7 +131,8 @@ def speed(n_gen: int = 128, model: str = "ternary") -> str:
 
 
 @app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol}, timeout=1800)
-def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2") -> str:
+def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2",
+                flags: str = "") -> str:
     import os
     import re
 
@@ -144,8 +145,11 @@ def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2")
     ids = re.sub(r"[\[\] ]", "", tok.stdout.strip().splitlines()[-1])
     print(f"prompt {prompt!r} -> ids {ids}")
 
+    import shlex
+
+    extra = shlex.split(flags)
     ours = subprocess.run(
-        ["/tmp/build/bt-run", "--model", MODELS[model], "--ids", ids, "--n", "1"],
+        ["/tmp/build/bt-run", "--model", MODELS[model], "--ids", ids, "--n", "4"] + extra,
         env={**env, "BT_PROBE": level}, capture_output=True, text=True)
     print("=== OURS ===")
     print(ours.stderr[-8000:])
@@ -200,11 +204,12 @@ def math500(n: int = 100, max_gen: int = 8192, model: str = "ternary") -> str:
 def main(inspect: str = "", scan: bool = False, gpu: bool = False,
          shapes: str = "", gguf: str = "", tensor: str = "",
          run_parity: bool = False, run_speed: bool = False, run_probe: bool = False,
-         run_math: bool = False, n_gen: int = 64, model: str = "ternary"):
+         run_math: bool = False, n_gen: int = 64, model: str = "ternary",
+         flags: str = ""):
     if run_math:
         print(math500.remote(model=model))
     elif run_probe:
-        print(debug_probe.remote(model=model))
+        print(debug_probe.remote(model=model, flags=flags))
     elif run_parity:
         print(parity.remote(n_gen=n_gen, model=model))
     elif run_speed:

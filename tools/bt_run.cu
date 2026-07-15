@@ -486,9 +486,30 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
     // prompt phase: mega mode feeds the megakernel token by token; otherwise
     // eager (graph capture only covers steady-state decode)
     if (rt.mega_mode) {
+        int mstep = 0;
         for (int id : prompt) {
             CUDA_CHECK(cudaMemcpyAsync(rt.d_tok, &id, 4, cudaMemcpyHostToDevice, rt.st));
             if (!mega_decode_launch(rt.mp, rt.st)) std::exit(1);
+            if (getenv("BT_PROBE") && mstep++ == 0) {
+                CUDA_CHECK(cudaStreamSynchronize(rt.st));
+                std::vector<float> hx((size_t)rt.m.hp.n_embd);
+                CUDA_CHECK(cudaMemcpy(hx.data(), rt.x, hx.size() * 4,
+                                      cudaMemcpyDeviceToHost));
+                double ss = 0;
+                for (float v : hx) ss += (double)v * v;
+                std::vector<int8_t> ha(256);
+                CUDA_CHECK(cudaMemcpy(ha.data(), rt.a8, 256, cudaMemcpyDeviceToHost));
+                int nz = 0;
+                for (int8_t v : ha) nz += v != 0;
+                float hy[4];
+                CUDA_CHECK(cudaMemcpy(hy, rt.y32, 16, cudaMemcpyDeviceToHost));
+                int32_t tok = -1;
+                CUDA_CHECK(cudaMemcpy(&tok, rt.d_tok, 4, cudaMemcpyDeviceToHost));
+                std::fprintf(stderr,
+                             "mega probe: ||x||=%.4f a8_nz=%d/256 y32[0..3]=%g %g %g %g "
+                             "tok=%d\n",
+                             std::sqrt(ss), nz, hy[0], hy[1], hy[2], hy[3], tok);
+            }
         }
         // bump advanced d_step during the prompt; generation records from 0
         CUDA_CHECK(cudaStreamSynchronize(rt.st));
