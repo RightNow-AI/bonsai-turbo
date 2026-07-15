@@ -26,6 +26,24 @@ __device__ __forceinline__ float softplus_f(float x) {
     return x > 20.f ? x : log1pf(expf(x));  // matches ggml_softplus
 }
 
+// idle-block trick: blocks with no head assigned in a narrow phase pull the
+// NEXT GEMV's weight codes into L2, so the following phase reads warm lines
+__device__ void prefetch_l2(const MegaParams& p, const MegaMat& m, int rel_bid,
+                            int nb_idle) {
+    if (nb_idle <= 0) return;
+    const size_t words = ((size_t)m.M * (m.nbits == 2 ? m.K / 4 : m.K / 8)) / 16;
+    const uint4* src = reinterpret_cast<const uint4*>(m.codes);
+    unsigned acc = 0;
+    for (size_t i = (size_t)rel_bid * blockDim.x + threadIdx.x; i < words;
+         i += (size_t)nb_idle * blockDim.x) {
+        acc += __ldg(&src[i]).x;
+    }
+    // defeat dead-code elimination without observable effect
+    if (acc == 0x9E3779B9u && threadIdx.x == 0) {
+        atomicAdd(&p.red_scratch[2 * p.n_layer + 3], 0.f);
+    }
+}
+
 // ---- int8 group quantization (identical rounding to quant_acts_kernel) ----
 // one warp quantizes one 128-group whose values come from `val(j)`
 template <typename F>
@@ -108,12 +126,18 @@ __device__ void op_norm_partial(const MegaParams& p, int slot, int bid, int nblo
     }
 }
 
-// rmsnorm phase B: normalize+scale, quantize per 128-group (warp per group)
+// rmsnorm phase B: normalize+scale, quantize per 128-group (warp per group);
+// idle blocks stream the upcoming GEMV's codes into L2
 __device__ void op_norm_quant(const MegaParams& p, const __half* w, int slot,
-                              int bid, int nblocks) {
+                              const MegaMat* next, int bid, int nblocks) {
+    const int busy = (p.n_embd / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
+    if (next && bid >= busy) {
+        prefetch_l2(p, *next, bid - busy, nblocks - busy);
+        return;
+    }
     const float inv = rsqrtf(p.red_scratch[slot] / p.n_embd + p.rms_eps);
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = nblocks * (int)blockDim.x / 32;
+    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
     for (int g = warp; g < p.n_embd / 128; g += warps_total) {
         quant_group(g,
                     [&](int j) { return p.x[j] * inv * __half2float(w[j]); },
@@ -261,6 +285,11 @@ __device__ void op_gdn(const MegaParams& p, const MegaLayer& l, int bid,
     const __half* beta_raw = alpha_raw + Hv;
     __shared__ float s_k[S], s_q[S];
 
+    if (bid >= Hv) {
+        // no head for this block: warm the next GEMV's codes instead
+        prefetch_l2(p, l.out_proj, bid - Hv, nblocks - Hv);
+        return;
+    }
     for (int h = bid; h < Hv; h += nblocks) {
         const int hk = h % Hk;
         for (int i = threadIdx.x; i < S; i += blockDim.x) {
@@ -312,9 +341,14 @@ __device__ void op_gdn(const MegaParams& p, const MegaLayer& l, int bid,
 __device__ void op_gdn_gate_quant(const MegaParams& p, const MegaLayer& l,
                                   int bid, int nblocks) {
     const int Hv = p.ssm_dt_rank;
+    const int busy = (Hv + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
+    if (bid >= busy) {
+        prefetch_l2(p, l.out_proj, bid - busy, nblocks - busy);
+        return;
+    }
     const __half* z = p.big_a + l.in_rows;
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = nblocks * (int)blockDim.x / 32;
+    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
     const int lane = threadIdx.x & 31;
 
     for (int h = warp; h < Hv; h += warps_total) {
@@ -416,6 +450,10 @@ __device__ void op_attn(const MegaParams& p, const MegaLayer& l, int bid,
     float* s_l = s_m + kWarps;                                // kWarps
     float* s_acc = s_l + kWarps;                              // kWarps*D
 
+    if (bid >= H) {
+        prefetch_l2(p, l.out_proj, bid - H, nblocks - H);
+        return;
+    }
     for (int h = bid; h < H; h += nblocks) {
         const int hkv = h / (H / Hkv);
         for (int i = threadIdx.x; i < D; i += blockDim.x) {
@@ -484,9 +522,14 @@ __device__ void op_attn_gate_quant(const MegaParams& p, const MegaLayer& l,
                                    int bid, int nblocks) {
     const int D = p.head_dim;
     const int n = p.n_head * D;
+    const int busy = (n / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
+    if (bid >= busy) {
+        prefetch_l2(p, l.out_proj, bid - busy, nblocks - busy);
+        return;
+    }
     const __half* qg = p.big_a;
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = nblocks * (int)blockDim.x / 32;
+    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
     for (int g = warp; g < n / 128; g += warps_total) {
         quant_group(g,
                     [&](int j) {
@@ -502,8 +545,13 @@ __device__ void op_attn_gate_quant(const MegaParams& p, const MegaLayer& l,
 // swiglu over fused [gate|up] + quantize (group == 128 wide)
 __device__ void op_swiglu_quant(const MegaParams& p, const MegaLayer& l, int bid,
                                 int nblocks) {
+    const int busy = (p.n_ff / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
+    if (bid >= busy) {
+        prefetch_l2(p, l.down, bid - busy, nblocks - busy);
+        return;
+    }
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = nblocks * (int)blockDim.x / 32;
+    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
     for (int g = warp; g < p.n_ff / 128; g += warps_total) {
         quant_group(g,
                     [&](int j) {
@@ -594,7 +642,7 @@ mega_decode_kernel(MegaParams p) {
         const MegaLayer& l = p.layers[il];
         op_norm_partial(p, 2 * il, bid, nb);
         grid.sync();
-        op_norm_quant(p, l.attn_norm, 2 * il, bid, nb);
+        op_norm_quant(p, l.attn_norm, 2 * il, &l.proj, bid, nb);
         grid.sync();
         op_gemv<1>(p, l.proj, nullptr, p.big_a, smem, bid, nb);
         grid.sync();
@@ -616,7 +664,7 @@ mega_decode_kernel(MegaParams p) {
         grid.sync();
         op_norm_partial(p, 2 * il + 1, bid, nb);
         grid.sync();
-        op_norm_quant(p, l.post_norm, 2 * il + 1, bid, nb);
+        op_norm_quant(p, l.post_norm, 2 * il + 1, &l.gate_up, bid, nb);
         grid.sync();
         op_gemv<1>(p, l.gate_up, nullptr, p.big_a, smem, bid, nb);
         grid.sync();
@@ -628,7 +676,7 @@ mega_decode_kernel(MegaParams p) {
 
     op_norm_partial(p, 2 * p.n_layer, bid, nb);
     grid.sync();
-    op_norm_quant(p, p.output_norm, 2 * p.n_layer, bid, nb);
+    op_norm_quant(p, p.output_norm, 2 * p.n_layer, &p.lm_head, bid, nb);
     grid.sync();
     op_gemv<0>(p, p.lm_head, p.y32, nullptr, smem, bid, nb);
     grid.sync();
