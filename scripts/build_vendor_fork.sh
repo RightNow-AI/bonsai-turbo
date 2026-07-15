@@ -23,15 +23,17 @@ fi
 git -C "$FORK_DIR" fetch --depth 1 origin "$FORK_SHA" || git -C "$FORK_DIR" fetch origin
 git -C "$FORK_DIR" checkout -q "$FORK_SHA"
 
-# Driverless build environments (CI containers, cloud builders) have nvcc but
-# no libcuda; link against the toolkit's stubs — the real driver binds at runtime.
-if command -v nvcc >/dev/null 2>&1 && ! ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
-    STUBS="$(dirname "$(command -v nvcc)")/../lib64/stubs"
+# Driverless build environments (CI containers, cloud builders) have the CUDA
+# toolkit but no libcuda; link against the toolkit's stubs — the real driver
+# binds at runtime. Harmless when a driver is present (link-time only).
+for STUBS in "${CUDA_HOME:-/usr/local/cuda}/lib64/stubs" /usr/local/cuda/lib64/stubs; do
     if [ -d "$STUBS" ]; then
         export LIBRARY_PATH="$STUBS:${LIBRARY_PATH:-}"
-        echo "== no libcuda found; linking against stubs at $STUBS"
+        export LDFLAGS="-L$STUBS ${LDFLAGS:-}"
+        echo "== linking against CUDA driver stubs at $STUBS"
+        break
     fi
-fi
+done
 
 GEN=()
 if command -v ninja >/dev/null 2>&1; then GEN=(-G Ninja); fi
