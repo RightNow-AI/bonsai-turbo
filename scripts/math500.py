@@ -141,7 +141,10 @@ def normalize(ans: str) -> str:
     a = a.replace("dfrac", "frac").replace("tfrac", "frac")
     a = a.replace("\\$", "").replace("$", "").replace("\\%", "").replace("%", "")
     a = a.replace("^\\circ", "").replace("^{\\circ}", "")
-    a = re.sub(r"\\text\{[^}]*\}", "", a)  # unit annotations
+    # whole-string \text{...} is the answer itself (e.g. \text{east}) — unwrap;
+    # embedded \text{...} is a unit annotation (e.g. 12\text{cm}) — delete
+    a = re.sub(r"^\\text\{(.*)\}$", r"\1", a)
+    a = re.sub(r"\\text\{[^}]*\}", "", a)
     a = re.sub(r"\\mbox\{[^}]*\}", "", a)
     a = re.sub(r"\s+", "", a)
     a = re.sub(r"^[a-z]=", "", a)          # "x=5" -> "5"
