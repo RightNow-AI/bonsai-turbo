@@ -631,11 +631,7 @@ __device__ __forceinline__ void stamp(const MegaParams& p) {
     }
 }
 
-// (256, 4): cap registers so 4 blocks co-reside per SM (50% occupancy). The
-// GEMV phases are memory-latency bound; at 2 blocks/SM (the default here) the
-// scheduler can't hide HBM latency and the big MLP matrices ran at ~40% of
-// peak vs 60%+ standalone. More resident warps > more registers per thread.
-__global__ void __launch_bounds__(256, 4)
+__global__ void __launch_bounds__(256)
 mega_decode_kernel(MegaParams p) {
     cg::grid_group grid = cg::this_grid();
     extern __shared__ uint8_t smem[];
