@@ -209,9 +209,9 @@ def main(inspect: str = "", scan: bool = False, gpu: bool = False,
          shapes: str = "", gguf: str = "", tensor: str = "",
          run_parity: bool = False, run_speed: bool = False, run_probe: bool = False,
          run_math: bool = False, n_gen: int = 64, model: str = "ternary",
-         flags: str = "", level: str = "2"):
+         flags: str = "", level: str = "2", math_n: int = 100):
     if run_math:
-        print(math500.remote(model=model))
+        print(math500.remote(model=model, n=math_n))
     elif run_probe:
         print(debug_probe.remote(model=model, flags=flags, level=level))
     elif run_parity:
