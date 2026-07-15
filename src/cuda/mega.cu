@@ -29,13 +29,15 @@ __device__ __forceinline__ float softplus_f(float x) {
 // idle-block trick: blocks with no head assigned in a narrow phase pull the
 // NEXT GEMV's weight codes into L2, so the following phase reads warm lines
 __device__ void prefetch_l2(const MegaParams& p, const MegaMat& m, int rel_bid,
-                            int nb_idle) {
+                            int nb_idle, int budget_words_per_block) {
     if (nb_idle <= 0) return;
     const size_t words = ((size_t)m.M * (m.nbits == 2 ? m.K / 4 : m.K / 8)) / 16;
     const uint4* src = reinterpret_cast<const uint4*>(m.codes);
+    // hard budget so the grid barrier never waits on a prefetching block
+    const size_t start = (size_t)rel_bid * budget_words_per_block;
+    const size_t end = min(words, start + (size_t)budget_words_per_block);
     unsigned acc = 0;
-    for (size_t i = (size_t)rel_bid * blockDim.x + threadIdx.x; i < words;
-         i += (size_t)nb_idle * blockDim.x) {
+    for (size_t i = start + threadIdx.x; i < end; i += blockDim.x) {
         acc += __ldg(&src[i]).x;
     }
     // defeat dead-code elimination without observable effect
@@ -131,10 +133,8 @@ __device__ void op_norm_partial(const MegaParams& p, int slot, int bid, int nblo
 __device__ void op_norm_quant(const MegaParams& p, const __half* w, int slot,
                               const MegaMat* next, int bid, int nblocks) {
     const int busy = (p.n_embd / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (next && bid >= busy) {
-        prefetch_l2(p, *next, bid - busy, nblocks - busy);
-        return;
-    }
+    if (bid >= busy) return;  // window too short for useful prefetch
+    (void)next;
     const float inv = rsqrtf(p.red_scratch[slot] / p.n_embd + p.rms_eps);
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
     const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
@@ -287,7 +287,7 @@ __device__ void op_gdn(const MegaParams& p, const MegaLayer& l, int bid,
 
     if (bid >= Hv) {
         // no head for this block: warm the next GEMV's codes instead
-        prefetch_l2(p, l.out_proj, bid - Hv, nblocks - Hv);
+        prefetch_l2(p, l.out_proj, bid - Hv, nblocks - Hv, 3072);
         return;
     }
     for (int h = bid; h < Hv; h += nblocks) {
@@ -342,10 +342,7 @@ __device__ void op_gdn_gate_quant(const MegaParams& p, const MegaLayer& l,
                                   int bid, int nblocks) {
     const int Hv = p.ssm_dt_rank;
     const int busy = (Hv + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (bid >= busy) {
-        prefetch_l2(p, l.out_proj, bid - busy, nblocks - busy);
-        return;
-    }
+    if (bid >= busy) return;
     const __half* z = p.big_a + l.in_rows;
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
     const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
@@ -451,7 +448,7 @@ __device__ void op_attn(const MegaParams& p, const MegaLayer& l, int bid,
     float* s_acc = s_l + kWarps;                              // kWarps*D
 
     if (bid >= H) {
-        prefetch_l2(p, l.out_proj, bid - H, nblocks - H);
+        prefetch_l2(p, l.out_proj, bid - H, nblocks - H, 3072);
         return;
     }
     for (int h = bid; h < H; h += nblocks) {
@@ -523,10 +520,7 @@ __device__ void op_attn_gate_quant(const MegaParams& p, const MegaLayer& l,
     const int D = p.head_dim;
     const int n = p.n_head * D;
     const int busy = (n / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (bid >= busy) {
-        prefetch_l2(p, l.out_proj, bid - busy, nblocks - busy);
-        return;
-    }
+    if (bid >= busy) return;
     const __half* qg = p.big_a;
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
     const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
@@ -546,10 +540,7 @@ __device__ void op_attn_gate_quant(const MegaParams& p, const MegaLayer& l,
 __device__ void op_swiglu_quant(const MegaParams& p, const MegaLayer& l, int bid,
                                 int nblocks) {
     const int busy = (p.n_ff / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (bid >= busy) {
-        prefetch_l2(p, l.down, bid - busy, nblocks - busy);
-        return;
-    }
+    if (bid >= busy) return;
     const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
     const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
     for (int g = warp; g < p.n_ff / 128; g += warps_total) {
