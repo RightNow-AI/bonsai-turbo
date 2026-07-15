@@ -164,7 +164,7 @@ def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2")
 
 
 @app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol},
-              timeout=3 * 3600)
+              timeout=3 * 3600, retries=modal.Retries(max_retries=2, initial_delay=10.0))
 def math500(n: int = 100, max_gen: int = 8192, model: str = "ternary") -> str:
     import os
 
