@@ -47,6 +47,27 @@ headroom. This repo goes after it with:
 | MATH-500 | F16 99.40, ternary 99.20, 1-bit 98.00 | HF model cards |
 | DSpark drafter | 6-layer block-parallel, 1.34x (ternary) / 1.37x (1-bit) on H100 | HF model cards |
 
+## Quickstart (any Linux box with an NVIDIA GPU — no cloud account needed)
+
+```bash
+# 1. weights (~11 GB: ternary + 1-bit packs; needs `pip install huggingface_hub`)
+./scripts/fetch_weights.sh
+
+# 2. vendor baseline to compare against (their llama.cpp fork, pinned SHA)
+./scripts/build_vendor_fork.sh          # CUDA_ARCHS=120 for RTX 5090
+./scripts/bench_baseline.sh             # tg128/pp512 for both packs
+./scripts/trace_baseline.sh             # nsys: launches/token, GPU idle %
+
+# 3. bonsai-turbo engine + tests
+cmake -B build -G Ninja && cmake --build build -j
+ctest --test-dir build
+./build/bt-inspect weights/Ternary-Bonsai-27B-Q2_0.gguf --scan-code3
+./build/bt-microbench                   # GEMV bandwidth + correctness
+```
+
+Maintainers run the same scripts on cloud GPUs via thin wrappers in
+`infra/modal/`; nothing in the engine depends on them.
+
 ## License
 
 Apache 2.0. This repo contains no vendor code; the PrismML llama.cpp fork is
