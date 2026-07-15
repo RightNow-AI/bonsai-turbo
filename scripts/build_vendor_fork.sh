@@ -25,12 +25,16 @@ git -C "$FORK_DIR" checkout -q "$FORK_SHA"
 
 # Driverless build environments (CI containers, cloud builders) have the CUDA
 # toolkit but no libcuda; link against the toolkit's stubs — the real driver
-# binds at runtime. Harmless when a driver is present (link-time only).
+# binds at runtime. ld also chases libggml-cuda.so's NEEDED libcuda.so.1 via
+# -rpath-link, and the stubs dir only ships libcuda.so, so provide a .so.1
+# symlink in a scratch dir. Harmless when a driver is present (link-time only).
 for STUBS in "${CUDA_HOME:-/usr/local/cuda}/lib64/stubs" /usr/local/cuda/lib64/stubs; do
-    if [ -d "$STUBS" ]; then
+    if [ -d "$STUBS" ] && [ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 ]; then
+        STUBLINK="$(mktemp -d)"
+        ln -sf "$STUBS/libcuda.so" "$STUBLINK/libcuda.so.1"
         export LIBRARY_PATH="$STUBS:${LIBRARY_PATH:-}"
-        export LDFLAGS="-L$STUBS ${LDFLAGS:-}"
-        echo "== linking against CUDA driver stubs at $STUBS"
+        export LDFLAGS="-L$STUBS -Wl,-rpath-link,$STUBLINK ${LDFLAGS:-}"
+        echo "== linking against CUDA driver stubs at $STUBS (rpath-link $STUBLINK)"
         break
     fi
 done

@@ -241,4 +241,42 @@ void conv1d_step_launch(const __half* x, const __half* w, float* conv_state,
     conv1d_step_kernel<<<blocks_for(C), kThreads, 0, stream>>>(x, w, conv_state, y, C, k);
 }
 
+namespace {
+
+__global__ void gather_heads_kernel(const __half* __restrict__ src, __half* __restrict__ dst,
+                                    int H, int D, int stride, int offset) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= H * D) return;
+    const int h = i / D, d = i % D;
+    dst[i] = src[(size_t)h * stride + offset + d];
+}
+
+// one warp per row; adequate for the rare non-quantized matrix
+__global__ void gemv_f16_kernel(const __half* __restrict__ W, const __half* __restrict__ x,
+                                float* __restrict__ y, int M, int K) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= M) return;
+    const int lane = threadIdx.x & 31;
+    const __half* wr = W + (size_t)row * K;
+    float acc = 0.f;
+    for (int i = lane; i < K; i += 32) {
+        acc += __half2float(wr[i]) * __half2float(x[i]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) y[row] = acc;
+}
+
+}  // namespace
+
+void gather_heads_launch(const __half* src, __half* dst, int H, int D, int stride,
+                         int offset, cudaStream_t stream) {
+    gather_heads_kernel<<<blocks_for(H * D), kThreads, 0, stream>>>(src, dst, H, D, stride, offset);
+}
+
+void gemv_f16_launch(const __half* W, const __half* x, float* y, int M, int K,
+                     cudaStream_t stream) {
+    gemv_f16_kernel<<<(M + 7) / 8, 256, 0, stream>>>(W, x, y, M, K);
+}
+
 }  // namespace bt

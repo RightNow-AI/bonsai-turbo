@@ -48,6 +48,15 @@ void embed_lookup_launch(const __half* table, int token, int n, __half* out,
 // single-vector argmax (greedy sampling); out[0] = index
 void argmax_launch(const float* x, int n, int32_t* out, cudaStream_t stream);
 
+// dst[h*D + d] = src[h*stride + offset + d] for h in [0,H): pulls the q or
+// gate half out of an interleaved [q|gate] per-head projection.
+void gather_heads_launch(const __half* src, __half* dst, int H, int D,
+                         int stride, int offset, cudaStream_t stream);
+
+// y[M] = W[M,K] @ x[K] for f16 weights (fallback for non-quantized matrices)
+void gemv_f16_launch(const __half* W, const __half* x, float* y, int M, int K,
+                     cudaStream_t stream);
+
 // causal conv1d decode step over C channels, kernel width k (matches
 // ggml_ssm_conv + trailing SiLU): hist = [state[c][0..k-2], x[c]];
 // y[c] = silu(sum_i hist[i] * w[c*k+i]); state shifts left by one.
