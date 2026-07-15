@@ -145,13 +145,13 @@ __device__ void op_gemv(const MegaParams& p, const MegaMat& m, float* dst32,
 
     for (int tile = bid; tile < tiles; tile += nblocks) {
         const int row0 = tile * 32 + warp * 4;
-        if (row0 >= m.M) continue;
-        const int nrows = min(4, m.M - row0);
+        // no early continue: the trailing __syncthreads() must stay uniform
+        const int nrows = row0 < m.M ? min(4, m.M - row0) : 0;
         const uint4* rc[4];
         const __half* rs[4];
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            const int row = row0 + (r < nrows ? r : 0);
+            const int row = min(row0 + (r < nrows ? r : 0), m.M - 1);
             rc[r] = reinterpret_cast<const uint4*>(m.codes + (size_t)row * (K >> 2));
             rs[r] = m.scales + (size_t)row * (K >> 7);
         }
@@ -208,9 +208,11 @@ __device__ void op_conv_l2(const MegaParams& p, const MegaLayer& l, int bid,
     __half* buf = p.big_a;
     __shared__ float s_v[128];
 
+    __shared__ float wsum[4];
     for (int tile = bid; tile < C / 128; tile += nblocks) {
         const int c0 = tile * 128;
-        // 128 threads compute their channel; 256-thread block: half idle here
+        // 128 threads compute their channel; barriers stay block-uniform
+        float sv = 0.f;
         if (threadIdx.x < 128) {
             const int c = c0 + threadIdx.x;
             float* st = l.conv_state + (size_t)c * (k - 1);
@@ -220,23 +222,27 @@ __device__ void op_conv_l2(const MegaParams& p, const MegaLayer& l, int bid,
             for (int i = 0; i < k - 1; ++i) acc += st[i] * __half2float(wc[i]);
             for (int i = 0; i < k - 2; ++i) st[i] = st[i + 1];
             st[k - 2] = xnv;
-            const float sv = acc / (1.f + expf(-acc));
+            sv = acc / (1.f + expf(-acc));
             s_v[threadIdx.x] = sv;
         }
         __syncthreads();
-        if (threadIdx.x < 128 && c0 < qk_ch) {
-            // l2 normalize this 128-wide head (matches l2norm_heads_kernel)
-            float ss = s_v[threadIdx.x] * s_v[threadIdx.x];
-            // block-level reduce over the first 4 warps
-            __shared__ float wsum[4];
-            float wsr = warp_sum(ss);
-            if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = wsr;
-            __syncthreads();
-            const float total = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            const float inv = rsqrtf(fmaxf(total, p.rms_eps));
-            buf[c0 + threadIdx.x] = __float2half(s_v[threadIdx.x] * inv);
-        } else if (threadIdx.x < 128) {
-            buf[c0 + threadIdx.x] = __float2half(s_v[threadIdx.x]);
+        // l2 reduction over the head's 128 values (all threads participate;
+        // upper half contributes zeros)
+        const float ss = threadIdx.x < 128 ? sv * sv : 0.f;
+        const float wsr = warp_sum(ss);
+        if ((threadIdx.x & 31) == 0 && threadIdx.x < 128) {
+            wsum[threadIdx.x >> 5] = wsr;
+        }
+        __syncthreads();
+        if (threadIdx.x < 128) {
+            if (c0 < qk_ch) {
+                // matches l2norm_heads_kernel
+                const float total = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+                const float inv = rsqrtf(fmaxf(total, p.rms_eps));
+                buf[c0 + threadIdx.x] = __float2half(sv * inv);
+            } else {
+                buf[c0 + threadIdx.x] = __float2half(sv);
+            }
         }
         __syncthreads();
     }
