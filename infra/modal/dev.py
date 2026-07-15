@@ -89,7 +89,7 @@ def microbench(shapes: str = "", gguf: str = "", tensor: str = "") -> str:
 
 
 @app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol}, timeout=3600)
-def parity(n_gen: int = 64, model: str = "ternary") -> str:
+def parity(n_gen: int = 64, model: str = "ternary", flags: str = "") -> str:
     _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
     _sh(["cmake", "--build", "/tmp/build", "-j"])
     env = {
@@ -99,6 +99,7 @@ def parity(n_gen: int = 64, model: str = "ternary") -> str:
         "BT_BUILD": "/tmp/build",
         "PARITY_MODEL": MODELS[model],
         "N_GEN": str(n_gen),
+        "BT_RUN_FLAGS": flags,
         "LD_LIBRARY_PATH": "/data/fork/build/bin",
     }
     import os
@@ -211,7 +212,7 @@ def main(inspect: str = "", scan: bool = False, gpu: bool = False,
     elif run_probe:
         print(debug_probe.remote(model=model, flags=flags))
     elif run_parity:
-        print(parity.remote(n_gen=n_gen, model=model))
+        print(parity.remote(n_gen=n_gen, model=model, flags=flags))
     elif run_speed:
         print(speed.remote(n_gen=max(n_gen, 128), model=model))
     elif gpu:

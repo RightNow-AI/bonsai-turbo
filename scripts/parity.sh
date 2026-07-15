@@ -38,7 +38,7 @@ echo "== vendor pass"
 
 echo "== bonsai-turbo pass"
 "$BT_BUILD/bt-run" --model "$MODEL" --ids-file "$OUT_DIR/ids.txt" --n "$N_GEN" \
-    --logits-out "$OUT_DIR/ours" | tee "$OUT_DIR/ours_tokens.txt"
+    ${BT_RUN_FLAGS:-} --logits-out "$OUT_DIR/ours" | tee "$OUT_DIR/ours_tokens.txt"
 
 echo "== comparing"
 PASS=0

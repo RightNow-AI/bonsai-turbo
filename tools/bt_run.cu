@@ -530,7 +530,25 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
     std::printf("generated:");
     int n_done = 0;
 
-    if (rt.mega_mode) {
+    if (rt.mega_mode && lf) {
+        // parity path: one launch per token, dumping logits before each argmax
+        int32_t tok = 0;
+        CUDA_CHECK(cudaMemcpy(&tok, rt.d_tok, 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaEventRecord(t0, rt.st));
+        for (int i = 0; i < n_gen; ++i) {
+            CUDA_CHECK(cudaMemcpy(logits.data(), rt.y32, (size_t)hp.vocab * 4,
+                                  cudaMemcpyDeviceToHost));
+            std::fwrite(logits.data(), 4, (size_t)hp.vocab, lf);
+            std::printf(" %d", tok);
+            ++n_done;
+            if (tok == rt.eos) break;
+            if (!mega_decode_launch(rt.mp, rt.st)) std::exit(1);
+            CUDA_CHECK(cudaStreamSynchronize(rt.st));
+            CUDA_CHECK(cudaMemcpy(&tok, rt.d_tok, 4, cudaMemcpyDeviceToHost));
+            rt.pos++;
+        }
+        CUDA_CHECK(cudaEventRecord(t1, rt.st));
+    } else if (rt.mega_mode) {
         int32_t first = 0;
         CUDA_CHECK(cudaMemcpy(&first, rt.d_tok, 4, cudaMemcpyDeviceToHost));
         std::printf(" %d", first);
