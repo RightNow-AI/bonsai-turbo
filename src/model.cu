@@ -234,9 +234,10 @@ void Model::load(const std::string& path) {
         l.down = L.mat(L.need({blk(il, "ffn_down.weight")}));
 
         if (l.recurrent) {
-            l.ssm_in = L.mat(L.need({blk(il, "ssm_in.weight")}));
-            l.ssm_gate = L.mat(L.need({blk(il, "ssm_in_gate.weight"),
-                                       blk(il, "ssm_z.weight"), blk(il, "ssm_x.weight"),
+            // Bonsai 27B names these attn_qkv/attn_gate even on delta-net layers
+            l.ssm_in = L.mat(L.need({blk(il, "attn_qkv.weight"), blk(il, "ssm_in.weight")}));
+            l.ssm_gate = L.mat(L.need({blk(il, "attn_gate.weight"),
+                                       blk(il, "ssm_in_gate.weight"),
                                        blk(il, "ssm_gate.weight")}));
             l.ssm_beta = L.mat(L.need({blk(il, "ssm_beta.weight")}));
             l.ssm_alpha = L.mat(L.need({blk(il, "ssm_alpha.weight")}));
