@@ -16,10 +16,22 @@ FORK_DIR="${FORK_DIR:-$ROOT/third_party/llama.cpp-prismml}"
 CUDA_ARCHS="${CUDA_ARCHS:-90}"
 
 if [ ! -d "$FORK_DIR/.git" ]; then
-    git clone "$FORK_REPO" "$FORK_DIR"
+    mkdir -p "$FORK_DIR"
+    git -C "$FORK_DIR" init -q
+    git -C "$FORK_DIR" remote add origin "$FORK_REPO"
 fi
 git -C "$FORK_DIR" fetch --depth 1 origin "$FORK_SHA" || git -C "$FORK_DIR" fetch origin
-git -C "$FORK_DIR" checkout "$FORK_SHA"
+git -C "$FORK_DIR" checkout -q "$FORK_SHA"
+
+# Driverless build environments (CI containers, cloud builders) have nvcc but
+# no libcuda; link against the toolkit's stubs — the real driver binds at runtime.
+if command -v nvcc >/dev/null 2>&1 && ! ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+    STUBS="$(dirname "$(command -v nvcc)")/../lib64/stubs"
+    if [ -d "$STUBS" ]; then
+        export LIBRARY_PATH="$STUBS:${LIBRARY_PATH:-}"
+        echo "== no libcuda found; linking against stubs at $STUBS"
+    fi
+fi
 
 GEN=()
 if command -v ninja >/dev/null 2>&1; then GEN=(-G Ninja); fi

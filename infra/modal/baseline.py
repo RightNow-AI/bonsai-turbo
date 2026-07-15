@@ -31,11 +31,8 @@ cuda_image = (
     )
     .pip_install("huggingface_hub[hf_transfer]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-    # bake the vendor fork build into the image so GPU seconds are never spent compiling
-    .add_local_file(REPO_ROOT / "scripts" / "build_vendor_fork.sh",
-                    "/opt/build_vendor_fork.sh", copy=True)
-    .run_commands("FORK_DIR=/opt/prism-llama.cpp CUDA_ARCHS=90 bash /opt/build_vendor_fork.sh")
-    # bench/trace scripts are mounted fresh at runtime — editing them never rebuilds
+    # scripts are mounted fresh at runtime — editing them never rebuilds the image;
+    # the fork itself is compiled once by build_fork (32 CPUs) into the volume
     .add_local_dir(REPO_ROOT / "scripts", "/repo/scripts")
 )
 
@@ -44,9 +41,10 @@ hf_image = modal.Image.debian_slim(python_version="3.12").pip_install(
 ).env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 
 RUN_ENV = {
-    "FORK_DIR": "/opt/prism-llama.cpp",
+    "FORK_DIR": "/data/fork",
     "WEIGHTS_DIR": "/data/weights",
     "OUT_DIR": "/data/results",
+    "LD_LIBRARY_PATH": "/data/fork/build/bin",
 }
 
 
@@ -64,10 +62,10 @@ def download_weights():
     return "weights ready"
 
 
-def _run_script(name: str) -> str:
+def _run_script(name: str, extra_env: dict | None = None) -> str:
     proc = subprocess.run(
         ["bash", f"/repo/scripts/{name}"],
-        env={**__import__("os").environ, **RUN_ENV},
+        env={**__import__("os").environ, **RUN_ENV, **(extra_env or {})},
         capture_output=True, text=True,
     )
     out = proc.stdout + ("\n--- stderr ---\n" + proc.stderr if proc.returncode else "")
@@ -75,6 +73,18 @@ def _run_script(name: str) -> str:
     data_vol.commit()
     if proc.returncode:
         raise RuntimeError(f"{name} exited {proc.returncode}")
+    return out
+
+
+@app.function(image=cuda_image, volumes={"/data": data_vol}, timeout=3600, cpu=32)
+def build_fork():
+    # compile on local disk (fast), persist only build/bin (binaries + libs)
+    out = _run_script("build_vendor_fork.sh", {"FORK_DIR": "/tmp/fork"})
+    subprocess.run(
+        ["bash", "-c", "mkdir -p /data/fork/build && cp -a /tmp/fork/build/bin /data/fork/build/"],
+        check=True,
+    )
+    data_vol.commit()
     return out
 
 
@@ -90,9 +100,19 @@ def trace():
 
 @app.local_entrypoint()
 def main(step: str = "all"):
-    if step in ("all", "download"):
-        print(download_weights.remote())
-    if step in ("all", "bench"):
+    if step == "all":
+        dl = download_weights.spawn()
+        fk = build_fork.spawn()
+        print(dl.get())
+        print(fk.get())
         print(bench.remote())
-    if step in ("all", "trace"):
+        print(trace.remote())
+        return
+    if step == "download":
+        print(download_weights.remote())
+    if step == "build":
+        print(build_fork.remote())
+    if step == "bench":
+        print(bench.remote())
+    if step == "trace":
         print(trace.remote())
