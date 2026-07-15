@@ -43,7 +43,9 @@ using namespace bt;
 
 namespace {
 
-constexpr int kRingCap = 8192;
+// token ring: graph/mega readback indexes it linearly (no wraparound), so it
+// must hold the longest generation (MATH-500 thinking traces run to 16k)
+constexpr int kRingCap = 32768;
 
 struct Runtime {
     Model m;
