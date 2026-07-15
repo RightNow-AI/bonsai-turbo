@@ -51,12 +51,12 @@ fi
 
 N_LO=8
 N_HI="${TRACE_N_HI:-40}"
+BENCH="$FORK_DIR/build/bin/llama-bench"
 for N in "$N_LO" "$N_HI"; do
-    echo "== profiled run: n=$N decode tokens"
+    echo "== profiled run: n=$N decode tokens (llama-bench, tg only)"
     CUPTI_SHIM_OUT="$OUT_DIR/shim_n$N.json" LD_PRELOAD="$SHIM" \
-        timeout 900 "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" -ngl 99 -no-cnv \
-        --temp 0 --seed 1 \
-        > "$OUT_DIR/cli_n$N.stdout" 2> "$OUT_DIR/cli_n$N.stderr"
+        timeout 900 "$BENCH" -m "$MODEL" -p 0 -n "$N" -r 1 -o json \
+        > "$OUT_DIR/bench_trace_n$N.json" 2> "$OUT_DIR/bench_trace_n$N.stderr"
 done
 
 python3 "$ROOT/scripts/analyze_trace.py" "$OUT_DIR" "$N_LO" "$N_HI" | tee "$OUT_DIR/trace_summary.json"

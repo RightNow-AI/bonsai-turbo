@@ -12,7 +12,7 @@ Inputs per run: shim_n{N}.json (cupti_shim output) and cli_n{N}.stderr
 (llama-cli perf print for the eval wall time).
 """
 import json
-import re
+
 import sys
 from pathlib import Path
 
@@ -22,11 +22,11 @@ def read_shim(out_dir: Path, n: int) -> dict:
 
 
 def eval_wall_ms(out_dir: Path, n: int) -> tuple[float, int]:
-    text = (out_dir / f"cli_n{n}.stderr").read_text(errors="replace")
-    m = re.search(r"eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*runs", text)
-    if not m:
-        raise ValueError(f"no eval-time line in cli_n{n}.stderr")
-    return float(m.group(1)), int(m.group(2))
+    rows = json.loads((out_dir / f"bench_trace_n{n}.json").read_text())
+    for row in rows:
+        if row.get("n_gen"):
+            return 1000.0 * row["n_gen"] / row["avg_ts"], int(row["n_gen"])
+    raise ValueError(f"no tg row in bench_trace_n{n}.json")
 
 
 def main() -> None:
