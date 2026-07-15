@@ -26,39 +26,46 @@ __device__ __forceinline__ float softplus_f(float x) {
     return x > 20.f ? x : log1pf(expf(x));  // matches ggml_softplus
 }
 
-// idle-block trick: blocks with no head assigned in a narrow phase pull the
-// NEXT GEMV's weight codes into L2, so the following phase reads warm lines
+// idle-block trick: blocks with no work in a narrow phase pull the NEXT
+// GEMV's weight codes into L2 — budget-bounded so the grid barrier never
+// waits on a prefetching block
 __device__ void prefetch_l2(const MegaParams& p, const MegaMat& m, int rel_bid,
                             int nb_idle, int budget_words_per_block) {
     if (nb_idle <= 0) return;
     const size_t words = ((size_t)m.M * (m.nbits == 2 ? m.K / 4 : m.K / 8)) / 16;
     const uint4* src = reinterpret_cast<const uint4*>(m.codes);
-    // hard budget so the grid barrier never waits on a prefetching block
     const size_t start = (size_t)rel_bid * budget_words_per_block;
     const size_t end = min(words, start + (size_t)budget_words_per_block);
     unsigned acc = 0;
     for (size_t i = start + threadIdx.x; i < end; i += blockDim.x) {
         acc += __ldg(&src[i]).x;
     }
-    // defeat dead-code elimination without observable effect
     if (acc == 0x9E3779B9u && threadIdx.x == 0) {
-        atomicAdd(&p.red_scratch[2 * p.n_layer + 3], 0.f);
+        atomicAdd(&p.red_scratch[0], 0.f);  // defeat DCE, no observable effect
     }
 }
 
-// ---- int8 group quantization (identical rounding to quant_acts_kernel) ----
-// one warp quantizes one 128-group whose values come from `val(j)`
-template <typename F>
-__device__ void quant_group(int g, F val, int8_t* a8, float* a_scale,
-                            int32_t* a_gsum64) {
+// ---- fused activation staging -----------------------------------------
+//
+// Every GEMV block quantizes its own activation copy straight into shared
+// memory, computing the producer op (norm / gates / swiglu) on the fly.
+// Rounding is identical to the standalone quant_acts kernel, so results stay
+// bit-compatible with the graph-mode engine.
+
+enum StageSrc {
+    SRC_NORM_X = 0,    // rmsnorm(x) * w        (inv precomputed from red_scratch)
+    SRC_GDN_GATE = 1,  // silu(z) * headnorm(gdn_out) * ssm_norm
+    SRC_ATTN_GATE = 2, // attn_out * sigmoid(gate from interleaved qg)
+    SRC_SWIGLU = 3,    // silu(gate) * up from fused [gate|up]
+};
+
+// quantize one 128-group of vals held per-lane (4 each) into block-local smem
+__device__ void quantize_vals(const float* vals, int g, int8_t* s_a8,
+                              float* s_scale, int32_t* s_gsum) {
     const int lane = threadIdx.x & 31;
-    float vals[4];
     float amax = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vals[i] = val(g * 128 + lane * 4 + i);
-        amax = fmaxf(amax, fabsf(vals[i]));
-    }
+    for (int i = 0; i < 4; ++i) amax = fmaxf(amax, fabsf(vals[i]));
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
@@ -75,101 +82,103 @@ __device__ void quant_group(int g, F val, int8_t* a8, float* a_scale,
         qp[i] = (int8_t)v;
         lsum += v;
     }
-    reinterpret_cast<char4*>(a8)[g * 32 + lane] = q;
+    reinterpret_cast<char4*>(s_a8)[g * 32 + lane] = q;
     const uint32_t half_mask = (lane < 16) ? 0x0000FFFFu : 0xFFFF0000u;
 #pragma unroll
     for (int off = 8; off > 0; off >>= 1) lsum += __shfl_down_sync(half_mask, lsum, off);
-    if ((lane & 15) == 0) a_gsum64[g * 2 + lane / 16] = lsum;
-    if (lane == 0) a_scale[g] = s;
+    if ((lane & 15) == 0) s_gsum[g * 2 + lane / 16] = lsum;
+    if (lane == 0) s_scale[g] = s;
 }
 
-// ---- ops --------------------------------------------------------------
-
-// embed: dequant row *d_tok into x; also zero this token's reduction cells
-__device__ void op_embed(const MegaParams& p, int gtid, int gsize) {
-    const int row = *p.d_tok;
-    const MegaMat& m = p.tok_embd;
-    for (int j = gtid; j < p.n_embd; j += gsize) {
-        const float d = __half2float(m.scales[(size_t)row * (m.K >> 7) + (j >> 7)]);
-        if (m.nbits == 2) {
-            const uint8_t* rc = m.codes + (size_t)row * (m.K >> 2);
-            const int word = j >> 4, r = j & 15, i = r >> 2, b = r & 3;
-            uint32_t w;
-            memcpy(&w, rc + 4 * word, 4);
-            const int q = (int)((w >> (8 * b + 2 * i)) & 3u);
-            p.x[j] = (float)(q - 1) * d;
-        } else {
-            const uint8_t* rc = m.codes + (size_t)row * (m.K >> 3);
-            const int word = j >> 5, r = j & 31, i = r >> 2, b = r & 3;
-            uint32_t w;
-            memcpy(&w, rc + 4 * word, 4);
-            const int bit = (int)((w >> (8 * b + i)) & 1u);
-            p.x[j] = bit ? d : -d;
+// compute this lane's 4 activation values of group g for the given source
+template <int SRC>
+__device__ void stage_vals(const MegaParams& p, const MegaLayer* l, float inv_norm,
+                           const __half* norm_w, int g, float* vals) {
+    const int lane = threadIdx.x & 31;
+    const int j0 = g * 128 + lane * 4;
+    if (SRC == SRC_NORM_X) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int j = j0 + i;
+            vals[i] = p.x[j] * inv_norm * __half2float(norm_w[j]);
+        }
+    } else if (SRC == SRC_SWIGLU) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int j = j0 + i;
+            const float gv = __half2float(p.big_a[j]);
+            const float uv = __half2float(p.big_a[l->mlp_gate_rows + j]);
+            vals[i] = gv / (1.f + expf(-gv)) * uv;
+        }
+    } else if (SRC == SRC_ATTN_GATE) {
+        const int D = p.head_dim;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int j = j0 + i;
+            const int h = j / D, d = j % D;
+            const float gate = __half2float(p.big_a[(size_t)h * 2 * D + D + d]);
+            vals[i] = __half2float(p.attn_out[j]) * (1.f / (1.f + expf(-gate)));
+        }
+    } else {  // SRC_GDN_GATE: group == one 128-wide value head
+        const __half* oh = p.attn_out + (size_t)g * 128;
+        const __half* z = p.big_a + l->in_rows;
+        float ss = 0.f;
+        float ov[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            ov[i] = __half2float(oh[lane * 4 + i]);
+            ss += ov[i] * ov[i];
+        }
+        ss = warp_sum(ss);
+        const float inv = rsqrtf(ss / 128 + p.rms_eps);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d = lane * 4 + i;
+            const float normed = ov[i] * inv * __half2float(l->ssm_norm[d]);
+            const float zv = __half2float(z[(size_t)g * 128 + d]);
+            vals[i] = zv / (1.f + expf(-zv)) * normed;
         }
     }
-    for (int j = gtid; j < 2 * p.n_layer + 4; j += gsize) p.red_scratch[j] = 0.f;
 }
 
-// rmsnorm phase A: accumulate sum(x^2) into red_scratch[slot]
-__device__ void op_norm_partial(const MegaParams& p, int slot, int bid, int nblocks) {
-    float ss = 0.f;
-    for (int i = bid * (int)blockDim.x + threadIdx.x; i < p.n_embd;
-         i += nblocks * (int)blockDim.x) {
-        ss += p.x[i] * p.x[i];
-    }
-    __shared__ float warp_acc[8];
-    const float w = warp_sum(ss);
-    if ((threadIdx.x & 31) == 0) warp_acc[threadIdx.x >> 5] = w;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float t = 0.f;
-        for (int i = 0; i < (int)blockDim.x / 32; ++i) t += warp_acc[i];
-        atomicAdd(&p.red_scratch[slot], t);
-    }
-}
-
-// rmsnorm phase B: normalize+scale, quantize per 128-group (warp per group);
-// idle blocks stream the upcoming GEMV's codes into L2
-__device__ void op_norm_quant(const MegaParams& p, const __half* w, int slot,
-                              const MegaMat* next, int bid, int nblocks) {
-    const int busy = (p.n_embd / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (bid >= busy) return;  // window too short for useful prefetch
-    (void)next;
-    const float inv = rsqrtf(p.red_scratch[slot] / p.n_embd + p.rms_eps);
-    const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
-    for (int g = warp; g < p.n_embd / 128; g += warps_total) {
-        quant_group(g,
-                    [&](int j) { return p.x[j] * inv * __half2float(w[j]); },
-                    p.a8, p.a_scale, p.a_gsum);
-    }
-}
-
-// GEMV over re-tiled Q2 codes: v5 inner loop, grid-strided 32-row tiles.
-// EPI 0: y32 store, 1: f16 store (dst16), 2: += into f32 (dst32)
-template <int EPI>
-__device__ void op_gemv(const MegaParams& p, const MegaMat& m, float* dst32,
-                        __half* dst16, uint8_t* smem, int bid, int nblocks) {
+// ---- the GEMV phase ----------------------------------------------------
+//
+// EPI 0: store f32 into dst32 (logits)
+// EPI 1: store f16 into dst16 (projections)
+// EPI 2: accumulate into dst32 (fp32 residual); when norm_slot >= 0 the
+//        epilogue also accumulates sum(x_new^2) into red_scratch[norm_slot],
+//        replacing the next norm's partial-reduction phase entirely.
+template <int EPI, int SRC>
+__device__ void op_gemv(const MegaParams& p, const MegaLayer* l, const MegaMat& m,
+                        float* dst32, __half* dst16, int norm_slot,
+                        float inv_norm, const __half* norm_w, uint8_t* smem,
+                        int bid, int nblocks) {
     const int K = m.K;
     int8_t* s_a8 = reinterpret_cast<int8_t*>(smem);
     float* s_scale = reinterpret_cast<float*>(smem + K);
     int32_t* s_gsum = reinterpret_cast<int32_t*>(smem + K + (K / 128) * 4);
 
-    for (int i = threadIdx.x; i < K / 16; i += blockDim.x) {
-        reinterpret_cast<uint4*>(s_a8)[i] = reinterpret_cast<const uint4*>(p.a8)[i];
+    // fused staging: producer op + int8 quantization, block-local
+    {
+        const int warp = threadIdx.x / 32;
+        const int warps = (int)blockDim.x / 32;
+        float vals[4];
+        for (int g = warp; g < K / 128; g += warps) {
+            stage_vals<SRC>(p, l, inv_norm, norm_w, g, vals);
+            quantize_vals(vals, g, s_a8, s_scale, s_gsum);
+        }
     }
-    for (int i = threadIdx.x; i < K / 128; i += blockDim.x) s_scale[i] = p.a_scale[i];
-    for (int i = threadIdx.x; i < K / 64; i += blockDim.x) s_gsum[i] = p.a_gsum[i];
     __syncthreads();
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
     const int chunks = (K / 4) / 16;
     const int tiles = (m.M + 31) / 32;
+    float block_ss = 0.f;  // fused norm partial (EPI 2 with norm_slot >= 0)
 
     for (int tile = bid; tile < tiles; tile += nblocks) {
         const int row0 = tile * 32 + warp * 4;
-        // no early continue: the trailing __syncthreads() must stay uniform
+        // no early continue: barriers below must stay block-uniform
         const int nrows = row0 < m.M ? min(4, m.M - row0) : 0;
         const uint4* rc[4];
         const __half* rs[4];
@@ -212,7 +221,9 @@ __device__ void op_gemv(const MegaParams& p, const MegaMat& m, float* dst32,
                 if (EPI == 1) {
                     dst16[row0 + r] = __float2half(acc[r]);
                 } else if (EPI == 2) {
-                    dst32[row0 + r] += acc[r];
+                    const float xn = dst32[row0 + r] + acc[r];
+                    dst32[row0 + r] = xn;
+                    if (norm_slot >= 0) block_ss += xn * xn;
                 } else {
                     dst32[row0 + r] = acc[r];
                 }
@@ -220,10 +231,66 @@ __device__ void op_gemv(const MegaParams& p, const MegaMat& m, float* dst32,
         }
         __syncthreads();  // s_a8 reused across tiles; keep warps in step
     }
+
+    if (EPI == 2 && norm_slot >= 0) {
+        // fold this block's sum(x_new^2) contribution into the next norm
+        __shared__ float warp_acc[8];
+        const float w = warp_sum(block_ss);
+        if ((threadIdx.x & 31) == 0) warp_acc[threadIdx.x >> 5] = w;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < (int)blockDim.x / 32; ++i) t += warp_acc[i];
+            atomicAdd(&p.red_scratch[norm_slot], t);
+        }
+    }
 }
 
-// conv1d + SiLU over all channels, then L2-norm for q/k heads.
-// tile = 128 channels; q/k region = first 2*Sk*Hk channels (heads of 128)
+// ---- non-GEMV ops -------------------------------------------------------
+
+// embed: dequant row *d_tok into x, accumulate sum(x^2) into this token's
+// first norm slot, and zero the OTHER parity's slot bank for the next token
+__device__ void op_embed(const MegaParams& p, int slot0, int other_base,
+                         int slots_per_token, int bid, int nblocks) {
+    const int row = *p.d_tok;
+    const MegaMat& m = p.tok_embd;
+    const int gtid = bid * (int)blockDim.x + threadIdx.x;
+    const int gsize = nblocks * (int)blockDim.x;
+    float ss = 0.f;
+    for (int j = gtid; j < p.n_embd; j += gsize) {
+        const float d = __half2float(m.scales[(size_t)row * (m.K >> 7) + (j >> 7)]);
+        float v;
+        if (m.nbits == 2) {
+            const uint8_t* rc = m.codes + (size_t)row * (m.K >> 2);
+            const int word = j >> 4, r = j & 15, i = r >> 2, b = r & 3;
+            uint32_t w;
+            memcpy(&w, rc + 4 * word, 4);
+            v = (float)((int)((w >> (8 * b + 2 * i)) & 3u) - 1) * d;
+        } else {
+            const uint8_t* rc = m.codes + (size_t)row * (m.K >> 3);
+            const int word = j >> 5, r = j & 31, i = r >> 2, b = r & 3;
+            uint32_t w;
+            memcpy(&w, rc + 4 * word, 4);
+            v = ((w >> (8 * b + i)) & 1u) ? d : -d;
+        }
+        p.x[j] = v;
+        ss += v * v;
+    }
+    __shared__ float warp_acc[8];
+    const float w = warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) warp_acc[threadIdx.x >> 5] = w;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (int)blockDim.x / 32; ++i) t += warp_acc[i];
+        atomicAdd(&p.red_scratch[slot0], t);
+    }
+    for (int j = gtid; j < slots_per_token; j += gsize) {
+        p.red_scratch[other_base + j] = 0.f;
+    }
+}
+
+// conv1d + SiLU over all channels, then L2-norm for q/k heads
 __device__ void op_conv_l2(const MegaParams& p, const MegaLayer& l, int bid,
                            int nblocks) {
     const int C = p.conv_channels;
@@ -231,11 +298,10 @@ __device__ void op_conv_l2(const MegaParams& p, const MegaLayer& l, int bid,
     const int qk_ch = 2 * p.ssm_state * p.ssm_groups;
     __half* buf = p.big_a;
     __shared__ float s_v[128];
-
     __shared__ float wsum[4];
+
     for (int tile = bid; tile < C / 128; tile += nblocks) {
         const int c0 = tile * 128;
-        // 128 threads compute their channel; barriers stay block-uniform
         float sv = 0.f;
         if (threadIdx.x < 128) {
             const int c = c0 + threadIdx.x;
@@ -250,8 +316,6 @@ __device__ void op_conv_l2(const MegaParams& p, const MegaLayer& l, int bid,
             s_v[threadIdx.x] = sv;
         }
         __syncthreads();
-        // l2 reduction over the head's 128 values (all threads participate;
-        // upper half contributes zeros)
         const float ss = threadIdx.x < 128 ? sv * sv : 0.f;
         const float wsr = warp_sum(ss);
         if ((threadIdx.x & 31) == 0 && threadIdx.x < 128) {
@@ -260,7 +324,6 @@ __device__ void op_conv_l2(const MegaParams& p, const MegaLayer& l, int bid,
         __syncthreads();
         if (threadIdx.x < 128) {
             if (c0 < qk_ch) {
-                // matches l2norm_heads_kernel
                 const float total = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                 const float inv = rsqrtf(fmaxf(total, p.rms_eps));
                 buf[c0 + threadIdx.x] = __float2half(sv * inv);
@@ -272,8 +335,7 @@ __device__ void op_conv_l2(const MegaParams& p, const MegaLayer& l, int bid,
     }
 }
 
-// gated delta net step: one block per value head, grid-strided (port of
-// gdn_decode_kernel with S=128)
+// gated delta net step (block per value head); idle blocks prefetch out_proj
 __device__ void op_gdn(const MegaParams& p, const MegaLayer& l, int bid,
                        int nblocks) {
     constexpr int S = 128;
@@ -286,7 +348,6 @@ __device__ void op_gdn(const MegaParams& p, const MegaLayer& l, int bid,
     __shared__ float s_k[S], s_q[S];
 
     if (bid >= Hv) {
-        // no head for this block: warm the next GEMV's codes instead
         prefetch_l2(p, l.out_proj, bid - Hv, nblocks - Hv, 3072);
         return;
     }
@@ -298,7 +359,7 @@ __device__ void op_gdn(const MegaParams& p, const MegaLayer& l, int bid,
         }
         __syncthreads();
 
-        // ssm_a already stores -exp(A_log); same math as gdn_decode_kernel
+        // ssm_a already stores -exp(A_log)
         const float g = expf(l.ssm_a[h] *
                              softplus_f(__half2float(alpha_raw[h]) + l.ssm_dt[h]));
         const float beta = 1.f / (1.f + expf(-__half2float(beta_raw[h])));
@@ -336,58 +397,23 @@ __device__ void op_gdn(const MegaParams& p, const MegaLayer& l, int bid,
     }
 }
 
-// gated RMS norm over each 128-wide head + silu(z) gate + int8 quantization;
-// head == quant group, one warp each
-__device__ void op_gdn_gate_quant(const MegaParams& p, const MegaLayer& l,
-                                  int bid, int nblocks) {
-    const int Hv = p.ssm_dt_rank;
-    const int busy = (Hv + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (bid >= busy) return;
-    const __half* z = p.big_a + l.in_rows;
-    const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
-    const int lane = threadIdx.x & 31;
-
-    for (int h = warp; h < Hv; h += warps_total) {
-        const __half* oh = p.attn_out + (size_t)h * 128;
-        float ss = 0.f;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float v = __half2float(oh[lane * 4 + i]);
-            ss += v * v;
-        }
-        ss = warp_sum(ss);
-        const float inv = rsqrtf(ss / 128 + p.rms_eps);
-        quant_group(h,
-                    [&](int j) {
-                        const int d = j - h * 128;
-                        const float normed = __half2float(oh[d]) * inv *
-                                             __half2float(l.ssm_norm[d]);
-                        const float zv = __half2float(z[h * 128 + d]);
-                        return zv / (1.f + expf(-zv)) * normed;
-                    },
-                    p.a8, p.a_scale, p.a_gsum);
-    }
-}
-
-// attention prep: per q-head norm+rope into q_buf; per kv-head norm+rope k and
-// raw v appended straight into the caches at *d_pos
+// attention prep: q/k norm+rope, k/v appended into caches at *d_pos
 __device__ void op_attn_prep(const MegaParams& p, const MegaLayer& l, int bid,
                              int nblocks) {
     const int D = p.head_dim;
     const int H = p.n_head, Hkv = p.n_head_kv;
     const int pos = *p.d_pos;
-    const __half* qg = p.big_a;                       // [H][2D]
-    const __half* kk = p.big_a + l.in_rows;           // [Hkv][D]
+    const __half* qg = p.big_a;
+    const __half* kk = p.big_a + l.in_rows;
     const __half* vv = kk + Hkv * D;
     __shared__ float s_d[256];
+    __shared__ float wsum[8];
 
     for (int unit = bid; unit < H + 2 * Hkv; unit += nblocks) {
         const bool is_q = unit < H;
         const bool is_k = !is_q && unit < H + Hkv;
         const int h = is_q ? unit : (is_k ? unit - H : unit - H - Hkv);
         if (!is_q && !is_k) {
-            // v: raw copy into cache
             __half* vdst = l.v_cache + (size_t)pos * Hkv * D + (size_t)h * D;
             for (int i = threadIdx.x; i < D; i += blockDim.x) {
                 vdst[i] = vv[(size_t)h * D + i];
@@ -396,22 +422,19 @@ __device__ void op_attn_prep(const MegaParams& p, const MegaLayer& l, int bid,
         }
         const __half* src = is_q ? qg + (size_t)h * 2 * D : kk + (size_t)h * D;
         const __half* w = is_q ? l.q_norm : l.k_norm;
-        // rms over D
         float ss = 0.f;
         for (int i = threadIdx.x; i < D; i += blockDim.x) {
             const float v = __half2float(src[i]);
             s_d[i] = v;
             ss += v * v;
         }
-        __shared__ float wsum[8];
-        float wsr = warp_sum(ss);
+        const float wsr = warp_sum(ss);
         if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = wsr;
         __syncthreads();
         float total = 0.f;
         for (int i = 0; i < (int)blockDim.x / 32; ++i) total += wsum[i];
         const float inv = rsqrtf(total / D + p.rms_eps);
         __syncthreads();
-        // normalize + rope (pairs (i, i+rot/2) over first n_rot dims)
         __half* dst = is_q ? p.q_buf + (size_t)h * D
                            : l.k_cache + (size_t)pos * Hkv * D + (size_t)h * D;
         const int half_rot = p.n_rot / 2;
@@ -423,7 +446,8 @@ __device__ void op_attn_prep(const MegaParams& p, const MegaLayer& l, int bid,
                 float c, s;
                 sincosf(theta, &s, &c);
                 const float x0 = s_d[pair] * inv * __half2float(w[pair]);
-                const float x1 = s_d[pair + half_rot] * inv * __half2float(w[pair + half_rot]);
+                const float x1 =
+                    s_d[pair + half_rot] * inv * __half2float(w[pair + half_rot]);
                 v = i < half_rot ? x0 * c - x1 * s : x0 * s + x1 * c;
             }
             dst[i] = __float2half(v);
@@ -432,7 +456,7 @@ __device__ void op_attn_prep(const MegaParams& p, const MegaLayer& l, int bid,
     }
 }
 
-// softmax attention decode (port of attn_decode_kernel, block per head)
+// softmax attention decode; idle blocks prefetch out_proj
 __device__ void op_attn(const MegaParams& p, const MegaLayer& l, int bid,
                         int nblocks, uint8_t* smem) {
     constexpr int kWarps = 8;
@@ -442,10 +466,10 @@ __device__ void op_attn(const MegaParams& p, const MegaLayer& l, int bid,
     const int ctx_len = *p.d_pos + 1;
     const size_t kv_row = (size_t)Hkv * D;
 
-    float* s_q = reinterpret_cast<float*>(smem);              // D
-    float* s_m = s_q + D;                                     // kWarps
-    float* s_l = s_m + kWarps;                                // kWarps
-    float* s_acc = s_l + kWarps;                              // kWarps*D
+    float* s_q = reinterpret_cast<float*>(smem);
+    float* s_m = s_q + D;
+    float* s_l = s_m + kWarps;
+    float* s_acc = s_l + kWarps;
 
     if (bid >= H) {
         prefetch_l2(p, l.out_proj, bid - H, nblocks - H, 3072);
@@ -514,47 +538,6 @@ __device__ void op_attn(const MegaParams& p, const MegaLayer& l, int bid,
     }
 }
 
-// attention output gate (sigmoid, gate lives interleaved in qg) + quantize
-__device__ void op_attn_gate_quant(const MegaParams& p, const MegaLayer& l,
-                                   int bid, int nblocks) {
-    const int D = p.head_dim;
-    const int n = p.n_head * D;
-    const int busy = (n / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (bid >= busy) return;
-    const __half* qg = p.big_a;
-    const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
-    for (int g = warp; g < n / 128; g += warps_total) {
-        quant_group(g,
-                    [&](int j) {
-                        const int h = j / D, d = j % D;
-                        const float gate = __half2float(qg[(size_t)h * 2 * D + D + d]);
-                        return __half2float(p.attn_out[j]) *
-                               (1.f / (1.f + expf(-gate)));
-                    },
-                    p.a8, p.a_scale, p.a_gsum);
-    }
-}
-
-// swiglu over fused [gate|up] + quantize (group == 128 wide)
-__device__ void op_swiglu_quant(const MegaParams& p, const MegaLayer& l, int bid,
-                                int nblocks) {
-    const int busy = (p.n_ff / 128 + (int)blockDim.x / 32 - 1) / ((int)blockDim.x / 32);
-    if (bid >= busy) return;
-    const int warp = (bid * (int)blockDim.x + threadIdx.x) >> 5;
-    const int warps_total = min(nblocks, busy) * (int)blockDim.x / 32;
-    for (int g = warp; g < p.n_ff / 128; g += warps_total) {
-        quant_group(g,
-                    [&](int j) {
-                        const float gv = __half2float(p.big_a[j]);
-                        const float uv = __half2float(p.big_a[l.mlp_gate_rows + j]);
-                        return gv / (1.f + expf(-gv)) * uv;
-                    },
-                    p.a8, p.a_scale, p.a_gsum);
-    }
-}
-
-// argmax over y32 (partials per block, then block 0 finishes + bumps state)
 __device__ void op_argmax_partial(const MegaParams& p, int bid, int nblocks) {
     float best = -INFINITY;
     int besti = 0;
@@ -596,26 +579,22 @@ __device__ void op_argmax_partial(const MegaParams& p, int bid, int nblocks) {
 }
 
 __device__ void op_argmax_final_bump(const MegaParams& p, int nblocks) {
-    if (blockIdx.x != 0) return;
-    __shared__ float bv;
-    __shared__ int bi;
-    if (threadIdx.x == 0) {
-        bv = -INFINITY;
-        bi = 0;
-        for (int i = 0; i < nblocks; ++i) {
-            if (p.amax_v[i] > bv || (p.amax_v[i] == bv && p.amax_i[i] < bi)) {
-                bv = p.amax_v[i];
-                bi = p.amax_i[i];
-            }
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    float bv = -INFINITY;
+    int bi = 0;
+    for (int i = 0; i < nblocks; ++i) {
+        if (p.amax_v[i] > bv || (p.amax_v[i] == bv && p.amax_i[i] < bi)) {
+            bv = p.amax_v[i];
+            bi = p.amax_i[i];
         }
-        *p.d_tok = bi;
-        p.d_ring[*p.d_step % p.ring_cap] = bi;
-        ++*p.d_step;
-        ++*p.d_pos;
     }
+    *p.d_tok = bi;
+    p.d_ring[*p.d_step % p.ring_cap] = bi;
+    ++*p.d_step;
+    ++*p.d_pos;
 }
 
-// ---- the megakernel: one launch = one decoded token --------------------
+// ---- the megakernel: one launch = one decoded token ---------------------
 
 __global__ void __launch_bounds__(256)
 mega_decode_kernel(MegaParams p) {
@@ -623,53 +602,54 @@ mega_decode_kernel(MegaParams p) {
     extern __shared__ uint8_t smem[];
     const int bid = blockIdx.x;
     const int nb = gridDim.x;
-    const int gtid = bid * (int)blockDim.x + threadIdx.x;
-    const int gsz = nb * (int)blockDim.x;
 
-    op_embed(p, gtid, gsz);
+    // double-buffered norm slots keyed by token parity: this token uses its
+    // own bank while embed zeroes the other bank for the next token
+    const int spt = 2 * p.n_layer + 2;  // slots per token
+    const int parity = (int)(*p.d_step & 1);
+    const int base = parity * spt;
+    const int other = (1 - parity) * spt;
+    float* rs = p.red_scratch;
+
+    op_embed(p, base, other, spt, bid, nb);
     grid.sync();
 
     for (int il = 0; il < p.n_layer; ++il) {
         const MegaLayer& l = p.layers[il];
-        op_norm_partial(p, 2 * il, bid, nb);
-        grid.sync();
-        op_norm_quant(p, l.attn_norm, 2 * il, &l.proj, bid, nb);
-        grid.sync();
-        op_gemv<1>(p, l.proj, nullptr, p.big_a, smem, bid, nb);
+        const float inv1 = rsqrtf(rs[base + 2 * il] / p.n_embd + p.rms_eps);
+        op_gemv<1, SRC_NORM_X>(p, &l, l.proj, nullptr, p.big_a, -1, inv1,
+                               l.attn_norm, smem, bid, nb);
         grid.sync();
         if (l.recurrent) {
             op_conv_l2(p, l, bid, nb);
             grid.sync();
             op_gdn(p, l, bid, nb);
             grid.sync();
-            op_gdn_gate_quant(p, l, bid, nb);
+            op_gemv<2, SRC_GDN_GATE>(p, &l, l.out_proj, p.x, nullptr,
+                                     base + 2 * il + 1, 0.f, nullptr, smem, bid, nb);
         } else {
             op_attn_prep(p, l, bid, nb);
             grid.sync();
             op_attn(p, l, bid, nb, smem);
             grid.sync();
-            op_attn_gate_quant(p, l, bid, nb);
+            op_gemv<2, SRC_ATTN_GATE>(p, &l, l.out_proj, p.x, nullptr,
+                                      base + 2 * il + 1, 0.f, nullptr, smem, bid, nb);
         }
         grid.sync();
-        op_gemv<2>(p, l.out_proj, p.x, nullptr, smem, bid, nb);
+        const float inv2 = rsqrtf(rs[base + 2 * il + 1] / p.n_embd + p.rms_eps);
+        op_gemv<1, SRC_NORM_X>(p, &l, l.gate_up, nullptr, p.big_a, -1, inv2,
+                               l.post_norm, smem, bid, nb);
         grid.sync();
-        op_norm_partial(p, 2 * il + 1, bid, nb);
-        grid.sync();
-        op_norm_quant(p, l.post_norm, 2 * il + 1, &l.gate_up, bid, nb);
-        grid.sync();
-        op_gemv<1>(p, l.gate_up, nullptr, p.big_a, smem, bid, nb);
-        grid.sync();
-        op_swiglu_quant(p, l, bid, nb);
-        grid.sync();
-        op_gemv<2>(p, l.down, p.x, nullptr, smem, bid, nb);
+        const int next_slot =
+            il + 1 < p.n_layer ? base + 2 * (il + 1) : base + 2 * p.n_layer;
+        op_gemv<2, SRC_SWIGLU>(p, &l, l.down, p.x, nullptr, next_slot, 0.f,
+                               nullptr, smem, bid, nb);
         grid.sync();
     }
 
-    op_norm_partial(p, 2 * p.n_layer, bid, nb);
-    grid.sync();
-    op_norm_quant(p, p.output_norm, 2 * p.n_layer, &p.lm_head, bid, nb);
-    grid.sync();
-    op_gemv<0>(p, p.lm_head, p.y32, nullptr, smem, bid, nb);
+    const float inv_h = rsqrtf(rs[base + 2 * p.n_layer] / p.n_embd + p.rms_eps);
+    op_gemv<0, SRC_NORM_X>(p, nullptr, p.lm_head, p.y32, nullptr, -1, inv_h,
+                           p.output_norm, smem, bid, nb);
     grid.sync();
     op_argmax_partial(p, bid, nb);
     grid.sync();
@@ -682,7 +662,6 @@ bool mega_decode_launch(const MegaParams& p, cudaStream_t stream) {
     static int grid_size = 0;
     static int smem_bytes = 0;
     if (grid_size == 0) {
-        // largest GEMV K decides the activation-staging pool
         int max_k = std::max({p.n_embd, p.n_ff, p.ssm_dt_rank * p.head_v_dim,
                               p.n_head * p.head_dim});
         smem_bytes = max_k + (max_k / 128) * 4 + (max_k / 64) * 4;

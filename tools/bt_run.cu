@@ -109,7 +109,7 @@ struct Runtime {
         CUDA_CHECK(cudaMalloc(&d_step, 4));
         CUDA_CHECK(cudaMalloc(&d_tok, 4));
         CUDA_CHECK(cudaMalloc(&d_ring, kRingCap * 4));
-        CUDA_CHECK(cudaMalloc(&red_scratch, (size_t)(2 * hp.n_layer + 4) * 4));
+        CUDA_CHECK(cudaMalloc(&red_scratch, (size_t)(4 * hp.n_layer + 8) * 4));
         CUDA_CHECK(cudaMalloc(&amax_v, 4096 * 4));
         CUDA_CHECK(cudaMalloc(&amax_i, 4096 * 4));
 
@@ -235,6 +235,7 @@ struct Runtime {
         }
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
+        CUDA_CHECK(cudaMemset(red_scratch, 0, (size_t)(4 * m.hp.n_layer + 8) * 4));
         pos = 0;  // attn caches need no clear: reads cover [0, pos) only
     }
 
