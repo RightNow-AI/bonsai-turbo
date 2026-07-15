@@ -138,20 +138,26 @@ def cmd_prepare(args):
     from jinja2 import Template
 
     tpl = Template(template)
+
+    def tokenize(text: str) -> str:
+        last = None
+        for extra in (["--parse-special"], []):
+            last = subprocess.run(
+                [args.tokenizer_bin, "-m", args.model, "-p", text, "--ids"] + extra,
+                capture_output=True, text=True)
+            lines = [l for l in last.stdout.splitlines() if l.strip().startswith("[")]
+            if last.returncode == 0 and lines:
+                return re.sub(r"[\[\] ]", "", lines[-1].strip())
+        raise SystemExit(
+            f"tokenize failed rc={last.returncode}\n--- stdout tail ---\n"
+            f"{last.stdout[-500:]}\n--- stderr tail ---\n{last.stderr[-800:]}")
+
     ids_lines, refs = [], []
     for row in rows:
         msg = row["problem"] + "\n" + INSTRUCTION
         rendered = tpl.render(messages=[{"role": "user", "content": msg}],
                               add_generation_prompt=True)
-        proc = subprocess.run(
-            [args.tokenizer_bin, "-m", args.model, "-p", rendered, "--ids", "--parse-special"],
-            capture_output=True, text=True)
-        if proc.returncode != 0:  # older tokenizer without --parse-special
-            proc = subprocess.run(
-                [args.tokenizer_bin, "-m", args.model, "-p", rendered, "--ids"],
-                capture_output=True, text=True)
-        ids = re.sub(r"[\[\] ]", "", proc.stdout.strip().splitlines()[-1])
-        ids_lines.append(ids)
+        ids_lines.append(tokenize(rendered))
         refs.append({"answer": row["answer"], "problem": row["problem"]})
 
     (out / "ids.txt").write_text("\n".join(ids_lines) + "\n")
