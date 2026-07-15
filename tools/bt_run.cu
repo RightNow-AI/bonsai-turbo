@@ -201,8 +201,10 @@ void gdn_layer(Runtime& rt, int il) {
     l2norm_heads_launch(kc, kc, Hk, Sk, hp.rms_eps, rt.st);
     probe_vec(rt, "q_conv_l2", il, qc, Sk * Hk);
 
+    // the fork's GDN op scales its output by 1/sqrt(S_v) internally
     gdn_decode_launch(qc, kc, vc, alpha_raw, beta_raw, l.ssm_a, l.ssm_dt,
-                      rt.gdn_state[(size_t)il], rt.attn_out, Hv, Hk, Sv, 1.0f, rt.st);
+                      rt.gdn_state[(size_t)il], rt.attn_out, Hv, Hk, Sv,
+                      1.f / sqrtf((float)Sv), rt.st);
     probe_vec(rt, "gdn_core_out", il, rt.attn_out, hp.ssm_inner);
 
     rmsnorm_heads_launch(rt.attn_out, l.ssm_norm, rt.attn_out, Hv, Sv, hp.rms_eps, rt.st);
