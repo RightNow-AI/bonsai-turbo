@@ -96,9 +96,9 @@ def bench():
     return _run_script("bench_baseline.sh")
 
 
-@app.function(image=cuda_image, gpu="H100", volumes={"/data": data_vol}, timeout=2400)
+@app.function(image=cuda_image, gpu="H100", volumes={"/data": data_vol}, timeout=3600)
 def trace():
-    return _run_script("trace_baseline.sh")
+    return _run_script("trace_baseline.sh", {"TRACE_STAGE_LOCAL": "1"})
 
 
 @app.local_entrypoint()

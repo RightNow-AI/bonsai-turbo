@@ -23,13 +23,22 @@ if ! command -v nsys >/dev/null 2>&1; then
     exit 1
 fi
 
-for N in 8 72; do
+# network/FUSE-mounted weights are slow under the profiler; stage locally
+if [ "${TRACE_STAGE_LOCAL:-0}" = "1" ]; then
+    echo "== staging model to local disk"
+    cp -f "$MODEL" /tmp/trace-model.gguf
+    MODEL=/tmp/trace-model.gguf
+fi
+
+N_LO=8
+N_HI="${TRACE_N_HI:-40}"
+for N in "$N_LO" "$N_HI"; do
     echo "== nsys profile: n=$N decode tokens"
-    nsys profile -t cuda --force-overwrite true -o "$OUT_DIR/trace_n$N" \
+    timeout 900 nsys profile -t cuda --force-overwrite true -o "$OUT_DIR/trace_n$N" \
         "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" -ngl 99 -no-cnv --temp 0 --seed 1 \
         > "$OUT_DIR/cli_n$N.stdout" 2> "$OUT_DIR/cli_n$N.stderr"
-    nsys stats --report cuda_api_sum --report cuda_gpu_kern_sum --format csv \
+    timeout 600 nsys stats --report cuda_api_sum --report cuda_gpu_kern_sum --format csv \
         --output "$OUT_DIR/trace_n$N" --force-export true "$OUT_DIR/trace_n$N.nsys-rep" >/dev/null
 done
 
-python3 "$ROOT/scripts/analyze_trace.py" "$OUT_DIR" 8 72 | tee "$OUT_DIR/trace_summary.json"
+python3 "$ROOT/scripts/analyze_trace.py" "$OUT_DIR" "$N_LO" "$N_HI" | tee "$OUT_DIR/trace_summary.json"
