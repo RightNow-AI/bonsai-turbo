@@ -623,6 +623,12 @@ __device__ void op_argmax_final_bump(const MegaParams& p, int nblocks) {
 
 // ---- the megakernel: one launch = one decoded token ---------------------
 
+__device__ __forceinline__ void stamp(const MegaParams& p) {
+    if (p.ts && blockIdx.x == 0 && threadIdx.x == 0) {
+        p.ts[atomicAdd(p.ts_count, 1)] = (unsigned long long)clock64();
+    }
+}
+
 __global__ void __launch_bounds__(256)
 mega_decode_kernel(MegaParams p) {
     cg::grid_group grid = cg::this_grid();
@@ -638,8 +644,10 @@ mega_decode_kernel(MegaParams p) {
     const int other = (1 - parity) * spt;
     float* rs = p.red_scratch;
 
+    stamp(p);
     op_embed(p, base, other, spt, bid, nb);
     grid.sync();
+    stamp(p);
 
     for (int il = 0; il < p.n_layer; ++il) {
         const MegaLayer& l = p.layers[il];
@@ -647,45 +655,57 @@ mega_decode_kernel(MegaParams p) {
         op_gemv<1, SRC_NORM_X>(p, &l, l.proj, nullptr, p.big_a, -1, inv1,
                                l.attn_norm, smem, bid, nb);
         grid.sync();
+        stamp(p);
         if (l.recurrent) {
             op_conv_l2(p, l, bid, nb);
             grid.sync();
+            stamp(p);
             op_gdn(p, l, bid, nb);
             grid.sync();
+            stamp(p);
             op_quant_global<SRC_GDN_GATE>(p, l, p.ssm_dt_rank * p.head_v_dim,
                                           l.out_proj, bid, nb);
         } else {
             op_attn_prep(p, l, bid, nb);
             grid.sync();
+            stamp(p);
             op_attn(p, l, bid, nb, smem);
             grid.sync();
+            stamp(p);
             op_quant_global<SRC_ATTN_GATE>(p, l, p.n_head * p.head_dim,
                                            l.out_proj, bid, nb);
         }
         grid.sync();
+        stamp(p);
         op_gemv<2, SRC_FROM_A8>(p, &l, l.out_proj, p.x, nullptr,
                                 base + 2 * il + 1, 0.f, nullptr, smem, bid, nb);
         grid.sync();
+        stamp(p);
         const float inv2 = rsqrtf(rs[base + 2 * il + 1] / p.n_embd + p.rms_eps);
         op_gemv<1, SRC_NORM_X>(p, &l, l.gate_up, nullptr, p.big_a, -1, inv2,
                                l.post_norm, smem, bid, nb);
         grid.sync();
+        stamp(p);
         op_quant_global<SRC_SWIGLU>(p, l, p.n_ff, l.down, bid, nb);
         grid.sync();
+        stamp(p);
         const int next_slot =
             il + 1 < p.n_layer ? base + 2 * (il + 1) : base + 2 * p.n_layer;
         op_gemv<2, SRC_FROM_A8>(p, &l, l.down, p.x, nullptr, next_slot, 0.f,
                                 nullptr, smem, bid, nb);
         grid.sync();
+        stamp(p);
     }
 
     const float inv_h = rsqrtf(rs[base + 2 * p.n_layer] / p.n_embd + p.rms_eps);
     op_gemv<0, SRC_NORM_X>(p, nullptr, p.lm_head, p.y32, nullptr, -1, inv_h,
                            p.output_norm, smem, bid, nb);
     grid.sync();
+    stamp(p);
     op_argmax_partial(p, bid, nb);
     grid.sync();
     op_argmax_final_bump(p, nb);
+    stamp(p);
 }
 
 }  // namespace

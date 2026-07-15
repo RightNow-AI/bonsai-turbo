@@ -68,6 +68,8 @@ struct Runtime {
     float* red_scratch = nullptr;
     float* amax_v = nullptr;
     int32_t* amax_i = nullptr;
+    unsigned long long* d_ts = nullptr;
+    int* d_ts_count = nullptr;
     MegaLayer* d_mlayers = nullptr;
     MegaParams mp{};
 
@@ -112,6 +114,9 @@ struct Runtime {
         CUDA_CHECK(cudaMalloc(&red_scratch, (size_t)(4 * hp.n_layer + 8) * 4));
         CUDA_CHECK(cudaMalloc(&amax_v, 4096 * 4));
         CUDA_CHECK(cudaMalloc(&amax_i, 4096 * 4));
+        CUDA_CHECK(cudaMalloc(&d_ts, 4096 * 8));
+        CUDA_CHECK(cudaMalloc(&d_ts_count, 4));
+        CUDA_CHECK(cudaMemset(d_ts_count, 0, 4));
 
         for (int il = 0; il < hp.n_layer; ++il) {
             if (m.layers[(size_t)il].recurrent) {
@@ -220,6 +225,9 @@ struct Runtime {
         mp.d_tok = d_tok;
         mp.d_ring = d_ring;
         mp.ring_cap = kRingCap;
+        const char* pr = getenv("BT_PROBE");
+        mp.ts = (pr && atoi(pr) >= 3) ? d_ts : nullptr;
+        mp.ts_count = d_ts_count;
     }
 
     void reset_sequence() {

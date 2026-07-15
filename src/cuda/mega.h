@@ -59,6 +59,9 @@ struct MegaParams {
     // control state (device-resident)
     int32_t *d_pos, *d_step, *d_tok, *d_ring;
     int ring_cap;
+    // phase telemetry: block 0 stamps clock64() at every barrier when non-null
+    unsigned long long* ts;
+    int* ts_count;
 };
 
 // One launch decodes one token: embed(*d_tok) ... logits, argmax -> *d_tok,
