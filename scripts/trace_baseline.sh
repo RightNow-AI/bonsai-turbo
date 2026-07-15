@@ -34,7 +34,10 @@ N_LO=8
 N_HI="${TRACE_N_HI:-40}"
 for N in "$N_LO" "$N_HI"; do
     echo "== nsys profile: n=$N decode tokens"
-    timeout 900 nsys profile -t cuda --force-overwrite true -o "$OUT_DIR/trace_n$N" \
+    # --sample/--cpuctxsw off: CPU sampling needs perf_event privileges that
+    # containers usually lack and nsys stalls waiting for them
+    timeout 900 nsys profile --trace=cuda --sample=none --cpuctxsw=none \
+        --force-overwrite true -o "$OUT_DIR/trace_n$N" \
         "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" -ngl 99 -no-cnv --temp 0 --seed 1 \
         > "$OUT_DIR/cli_n$N.stdout" 2> "$OUT_DIR/cli_n$N.stderr"
     timeout 600 nsys stats --report cuda_api_sum --report cuda_gpu_kern_sum --format csv \
