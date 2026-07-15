@@ -512,9 +512,14 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
                              std::sqrt(ss), nz, hy[0], hy[1], hy[2], hy[3], tok);
             }
         }
-        // bump advanced d_step during the prompt; generation records from 0
+        // bump advanced d_step during the prompt; generation records from 0.
+        // Resetting the step counter changes the parity-bank schedule, so the
+        // norm scratch must be fully re-zeroed (odd prompts otherwise leave
+        // the first generation bank dirty -> all norms scaled by sqrt(2)).
         CUDA_CHECK(cudaStreamSynchronize(rt.st));
         CUDA_CHECK(cudaMemset(rt.d_step, 0, 4));
+        CUDA_CHECK(cudaMemset(rt.red_scratch, 0,
+                              (size_t)(4 * rt.m.hp.n_layer + 8) * 4));
         rt.pos = (int)prompt.size();
     } else {
         const bool want_graph = rt.graph_mode;
