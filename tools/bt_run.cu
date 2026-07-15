@@ -166,6 +166,9 @@ struct Runtime {
     }
 };
 
+void probe_vec(Runtime& rt, const char* name, int il, const __half* ptr, int n);
+void probe(Runtime& rt, const char* tag, int il);
+
 void gdn_layer(Runtime& rt, int il) {
     const HParams& hp = rt.m.hp;
     const Layer& l = rt.m.layers[(size_t)il];

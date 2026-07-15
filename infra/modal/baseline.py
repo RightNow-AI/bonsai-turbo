@@ -24,10 +24,10 @@ cuda_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "cmake", "ninja-build", "build-essential")
     .run_commands(
-        # nsys for launch/idle analysis; package name varies by CUDA repo vintage
-        "apt-get update && (apt-get install -y cuda-nsight-systems-12-8"
-        " || apt-get install -y nsight-systems-cli"
-        " || echo 'WARNING: nsys not installed')"
+        # CUPTI headers for the kernel-telemetry shim (trace_baseline.sh)
+        "apt-get update && (apt-get install -y cuda-cupti-dev-12-8"
+        " || apt-get install -y libcupti-dev"
+        " || echo 'WARNING: cupti headers not installed')"
     )
     .pip_install("huggingface_hub[hf_transfer]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})

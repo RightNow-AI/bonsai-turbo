@@ -20,8 +20,23 @@ MODEL="${TRACE_MODEL:-$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf}"
 PROMPT="The roofline model of GPU performance says"
 mkdir -p "$OUT_DIR"
 
-CUPTI_INC="${CUPTI_INC:-/usr/local/cuda/extras/CUPTI/include}"
-CUPTI_LIB="${CUPTI_LIB:-/usr/local/cuda/extras/CUPTI/lib64}"
+CUPTI_INC="${CUPTI_INC:-}"
+CUPTI_LIB="${CUPTI_LIB:-}"
+if [ -z "$CUPTI_INC" ]; then
+    for d in /usr/local/cuda/extras/CUPTI/include /usr/local/cuda/include /usr/include; do
+        [ -f "$d/cupti.h" ] && CUPTI_INC="$d" && break
+    done
+fi
+if [ -z "$CUPTI_LIB" ]; then
+    for d in /usr/local/cuda/extras/CUPTI/lib64 /usr/local/cuda/lib64 \
+             /usr/lib/x86_64-linux-gnu; do
+        ls "$d"/libcupti.so* >/dev/null 2>&1 && CUPTI_LIB="$d" && break
+    done
+fi
+if [ -z "$CUPTI_INC" ] || [ -z "$CUPTI_LIB" ]; then
+    echo "!! CUPTI not found (install cuda-cupti-dev); skipping trace" >&2
+    exit 1
+fi
 SHIM="$OUT_DIR/cupti_shim.so"
 echo "== building CUPTI shim"
 gcc -shared -fPIC "$ROOT/tools/cupti_shim.c" -I"$CUPTI_INC" -L"$CUPTI_LIB" \
