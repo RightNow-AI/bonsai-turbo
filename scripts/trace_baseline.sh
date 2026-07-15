@@ -20,27 +20,9 @@ MODEL="${TRACE_MODEL:-$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf}"
 PROMPT="The roofline model of GPU performance says"
 mkdir -p "$OUT_DIR"
 
-CUPTI_INC="${CUPTI_INC:-}"
-CUPTI_LIB="${CUPTI_LIB:-}"
-if [ -z "$CUPTI_INC" ]; then
-    for d in /usr/local/cuda/extras/CUPTI/include /usr/local/cuda/include /usr/include; do
-        [ -f "$d/cupti.h" ] && CUPTI_INC="$d" && break
-    done
-fi
-if [ -z "$CUPTI_LIB" ]; then
-    for d in /usr/local/cuda/extras/CUPTI/lib64 /usr/local/cuda/lib64 \
-             /usr/lib/x86_64-linux-gnu; do
-        ls "$d"/libcupti.so* >/dev/null 2>&1 && CUPTI_LIB="$d" && break
-    done
-fi
-if [ -z "$CUPTI_INC" ] || [ -z "$CUPTI_LIB" ]; then
-    echo "!! CUPTI not found (install cuda-cupti-dev); skipping trace" >&2
-    exit 1
-fi
-SHIM="$OUT_DIR/cupti_shim.so"
-echo "== building CUPTI shim"
-gcc -shared -fPIC "$ROOT/tools/cupti_shim.c" -I"$CUPTI_INC" -L"$CUPTI_LIB" \
-    -lcupti -Wl,-rpath,"$CUPTI_LIB" -o "$SHIM"
+SHIM="$OUT_DIR/launch_counter.so"
+echo "== building launch counter"
+gcc -shared -fPIC "$ROOT/tools/launch_counter.c" -ldl -o "$SHIM"
 
 # network/FUSE-mounted weights are slow to load repeatedly; stage locally
 if [ "${TRACE_STAGE_LOCAL:-0}" = "1" ]; then
@@ -54,9 +36,19 @@ N_HI="${TRACE_N_HI:-40}"
 BENCH="$FORK_DIR/build/bin/llama-bench"
 for N in "$N_LO" "$N_HI"; do
     echo "== profiled run: n=$N decode tokens (llama-bench, tg only)"
-    CUPTI_SHIM_OUT="$OUT_DIR/shim_n$N.json" LD_PRELOAD="$SHIM" \
+    if [ "$N" = "$N_HI" ]; then
+        # sample SM utilization during the long run: NVML "utilization.gpu" is
+        # the fraction of time a kernel was resident = 1 - idle-between-launches
+        nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
+            --loop-ms=100 > "$OUT_DIR/smi_util.csv" &
+        SMI_PID=$!
+    fi
+    LAUNCH_COUNTER_OUT="$OUT_DIR/shim_n$N.json" LD_PRELOAD="$SHIM" \
         timeout 900 "$BENCH" -m "$MODEL" -p 0 -n "$N" -r 1 -o json \
         > "$OUT_DIR/bench_trace_n$N.json" 2> "$OUT_DIR/bench_trace_n$N.stderr"
+    if [ "$N" = "$N_HI" ]; then
+        kill "$SMI_PID" 2>/dev/null || true
+    fi
 done
 
 python3 "$ROOT/scripts/analyze_trace.py" "$OUT_DIR" "$N_LO" "$N_HI" | tee "$OUT_DIR/trace_summary.json"

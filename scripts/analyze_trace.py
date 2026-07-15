@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Derive per-token decode cost from two CUPTI-shim profiled runs.
+"""Derive per-token decode cost from two launch-counted runs.
 
-trace_baseline.sh records the vendor CLI generating N_LO and N_HI tokens.
-Everything outside decode (model load, warmup, prompt processing) is identical
-between the runs, so differencing cancels it:
+trace_baseline.sh runs llama-bench tg-only with N_LO and N_HI tokens under an
+LD_PRELOAD launch counter. Everything outside decode (load, warmup) is
+identical between runs, so differencing cancels it:
 
-    kernels_per_token = (kernels_hi - kernels_lo) / (n_hi - n_lo)
-    gpu_busy_fraction = (kernel_ns_hi - kernel_ns_lo) / (eval_wall_hi - eval_wall_lo)
+    launches_per_token = (launches_hi - launches_lo) / (n_hi - n_lo)
 
-Inputs per run: shim_n{N}.json (cupti_shim output) and cli_n{N}.stderr
-(llama-cli perf print for the eval wall time).
+GPU busy fraction comes from NVML utilization sampled during the long run
+(fraction of time a kernel was resident = 1 - idle between launches). The
+top-quartile median is reported to exclude load/idle phases of the sample
+window.
 """
 import json
-
+import statistics
 import sys
 from pathlib import Path
 
@@ -36,18 +37,23 @@ def main() -> None:
 
     d_tok = runs_hi - runs_lo
     d_wall_ms = wall_hi - wall_lo
-    d_kern_ms = (hi["kernel_ns"] - lo["kernel_ns"]) / 1e6
-    d_mem_ms = (hi["memop_ns"] - lo["memop_ns"]) / 1e6
-    busy = (d_kern_ms + d_mem_ms) / d_wall_ms if d_wall_ms > 0 else float("nan")
+
+    busy_pct = None
+    smi = out_dir / "smi_util.csv"
+    if smi.exists():
+        samples = sorted(int(l) for l in smi.read_text().split() if l.strip().isdigit())
+        if samples:
+            top = samples[3 * len(samples) // 4:]  # decode-active samples
+            busy_pct = statistics.median(top) if top else None
 
     print(json.dumps({
         "decode_tokens_differenced": d_tok,
-        "kernels_per_token": round((hi["kernels"] - lo["kernels"]) / d_tok, 1),
+        "api_launches_per_token": round((hi["launches"] - lo["launches"]) / d_tok, 1),
+        "graph_launches_per_token": round((hi["graph_launches"] - lo["graph_launches"]) / d_tok, 2),
         "memops_per_token": round((hi["memops"] - lo["memops"]) / d_tok, 1),
         "decode_wall_ms_per_token": round(d_wall_ms / d_tok, 3),
-        "gpu_kernel_ms_per_token": round(d_kern_ms / d_tok, 3),
-        "gpu_busy_fraction_decode": round(busy, 3),
-        "gpu_idle_pct_decode": round(100 * (1 - busy), 1),
+        "gpu_busy_pct_nvml": busy_pct,
+        "gpu_idle_pct_nvml": None if busy_pct is None else round(100 - busy_pct, 1),
         "implied_tok_s_from_wall": round(1000 * d_tok / d_wall_ms, 1),
     }, indent=2))
 
