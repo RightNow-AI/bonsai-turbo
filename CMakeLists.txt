@@ -47,11 +47,15 @@ if(CMAKE_CUDA_COMPILER)
         src/cuda/ops.cu
         src/cuda/gdn.cu
         src/cuda/attn.cu
+        src/model.cu
     )
     target_include_directories(bt_cuda PUBLIC src)
 
     add_executable(bt-microbench tools/bt_microbench.cu)
     target_link_libraries(bt-microbench PRIVATE bt_core bt_cuda)
+
+    add_executable(bt-run tools/bt_run.cu)
+    target_link_libraries(bt-run PRIVATE bt_core bt_cuda)
 else()
     message(STATUS "CUDA not found: building loader/tools only")
 endif()
