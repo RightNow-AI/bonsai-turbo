@@ -52,7 +52,8 @@ struct Runtime {
     cudaStream_t st = nullptr;
 
     // activation buffers (f16 unless noted)
-    __half *x, *xn, *big_a, *big_b, *q, *k, *v, *attn_out, *gdn_out;
+    float* x;  // fp32 residual stream
+    __half *xn, *big_a, *big_b, *q, *k, *v, *attn_out, *gdn_out;
     float* y32;
     int8_t* a8;
     float* a_scale;
@@ -81,7 +82,7 @@ struct Runtime {
                                   hp.ssm_inner, hp.n_embd});
         const int max_k = std::max({hp.n_embd, hp.ssm_inner, hp.n_ff,
                                     hp.head_dim * hp.n_head});
-        CUDA_CHECK(cudaMalloc(&x, hp.n_embd * 2));
+        CUDA_CHECK(cudaMalloc(&x, hp.n_embd * 4));
         CUDA_CHECK(cudaMalloc(&xn, hp.n_embd * 2));
         CUDA_CHECK(cudaMalloc(&big_a, (size_t)big * 2));
         CUDA_CHECK(cudaMalloc(&big_b, (size_t)big * 2));
@@ -175,7 +176,7 @@ void gdn_layer(Runtime& rt, int il) {
     const int Sk = hp.ssm_state, Hk = hp.ssm_groups;
     const int Sv = hp.head_v_dim, Hv = hp.ssm_dt_rank;
 
-    rmsnorm_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
+    rmsnorm_f32_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
     probe_vec(rt, "attn_norm", il, rt.xn, hp.n_embd);
     rt.quant(rt.xn, hp.n_embd);
 
@@ -212,9 +213,8 @@ void gdn_layer(Runtime& rt, int il) {
     probe_vec(rt, "final_output", il, rt.attn_out, hp.ssm_inner);
 
     rt.quant(rt.attn_out, hp.ssm_inner);
-    rt.mv_f16out(l.ssm_out, rt.attn_out, rt.y32, rt.xn);
-    probe_vec(rt, "linear_attn_out", il, rt.xn, hp.n_embd);
-    add_inplace_launch(rt.x, rt.xn, hp.n_embd, rt.st);
+    rt.mv16(l.ssm_out, rt.attn_out, rt.y32);
+    add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
 }
 
 void attn_layer(Runtime& rt, int il) {
@@ -222,7 +222,7 @@ void attn_layer(Runtime& rt, int il) {
     const Layer& l = rt.m.layers[(size_t)il];
     const int D = hp.head_dim, H = hp.n_head, Hkv = hp.n_head_kv;
 
-    rmsnorm_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
+    rmsnorm_f32_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
     rt.quant(rt.xn, hp.n_embd);
 
     rt.mv_f16out(l.wq, rt.xn, rt.y32, rt.big_a);  // [H][2D] interleaved q|gate
@@ -261,21 +261,21 @@ void attn_layer(Runtime& rt, int il) {
     sigmoid_mul_launch(rt.attn_out, rt.big_b, rt.attn_out, H * D, rt.st);
 
     rt.quant(rt.attn_out, H * D);
-    rt.mv_f16out(l.wo, rt.attn_out, rt.y32, rt.xn);
-    add_inplace_launch(rt.x, rt.xn, hp.n_embd, rt.st);
+    rt.mv16(l.wo, rt.attn_out, rt.y32);
+    add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
 }
 
 void mlp(Runtime& rt, int il) {
     const HParams& hp = rt.m.hp;
     const Layer& l = rt.m.layers[(size_t)il];
-    rmsnorm_launch(rt.x, l.attn_post_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
+    rmsnorm_f32_launch(rt.x, l.attn_post_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
     rt.quant(rt.xn, hp.n_embd);
     rt.mv_f16out(l.gate, rt.xn, rt.y32, rt.big_a);
     rt.mv_f16out(l.up, rt.xn, rt.y32, rt.big_b);
     silu_mul_launch(rt.big_a, rt.big_b, rt.big_a, hp.n_ff, rt.st);
     rt.quant(rt.big_a, hp.n_ff);
-    rt.mv_f16out(l.down, rt.big_a, rt.y32, rt.xn);
-    add_inplace_launch(rt.x, rt.xn, hp.n_embd, rt.st);
+    rt.mv16(l.down, rt.big_a, rt.y32);
+    add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);
 }
 
 // BT_PROBE=1: print ||x|| after embed and each layer (first decode step only)
@@ -304,12 +304,12 @@ void probe(Runtime& rt, const char* tag, int il) {
         g_probe_done++;
         return;
     }
-    std::vector<__half> h((size_t)rt.m.hp.n_embd);
+    std::vector<float> h((size_t)rt.m.hp.n_embd);
     CUDA_CHECK(cudaStreamSynchronize(rt.st));
-    CUDA_CHECK(cudaMemcpy(h.data(), rt.x, h.size() * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h.data(), rt.x, h.size() * 4, cudaMemcpyDeviceToHost));
     double ss = 0, sum = 0;
-    for (__half v : h) {
-        const double f = __half2float(v);
+    for (float v : h) {
+        const double f = v;
         ss += f * f;
         sum += f;
     }
@@ -320,18 +320,13 @@ void probe(Runtime& rt, const char* tag, int il) {
 // layer stack + head; embed comes from host `token` (eager) or *d_tok (graph)
 void decode_body(Runtime& rt, int token) {
     const HParams& hp = rt.m.hp;
+    // fp32 residual stream: quantized embeddings only (true for all Bonsai packs)
     if (rt.graph_mode) {
-        if (rt.m.tok_embd.nbits == 16) {
-            embed_lookup_dev_launch(rt.m.tok_embd.dense, rt.d_tok, hp.n_embd, rt.x, rt.st);
-        } else {
-            dequant_row_dev_launch(rt.m.tok_embd.nbits, rt.m.tok_embd.codes,
+        dequant_row_f32_dev_launch(rt.m.tok_embd.nbits, rt.m.tok_embd.codes,
                                    rt.m.tok_embd.scales, rt.d_tok, hp.n_embd, rt.x, rt.st);
-        }
-    } else if (rt.m.tok_embd.nbits == 16) {
-        embed_lookup_launch(rt.m.tok_embd.dense, token, hp.n_embd, rt.x, rt.st);
     } else {
-        dequant_row_launch(rt.m.tok_embd.nbits, rt.m.tok_embd.codes,
-                           rt.m.tok_embd.scales, token, hp.n_embd, rt.x, rt.st);
+        dequant_row_f32_launch(rt.m.tok_embd.nbits, rt.m.tok_embd.codes,
+                               rt.m.tok_embd.scales, token, hp.n_embd, rt.x, rt.st);
     }
     probe(rt, "embed", -1);
     for (int il = 0; il < hp.n_layer; ++il) {
@@ -346,7 +341,7 @@ void decode_body(Runtime& rt, int token) {
         probe(rt, "mlp", il);
     }
     probe(rt, "done", -1);
-    rmsnorm_launch(rt.x, rt.m.output_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
+    rmsnorm_f32_launch(rt.x, rt.m.output_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
     rt.quant(rt.xn, hp.n_embd);
     rt.mv16(rt.m.lm_head, rt.xn, rt.y32);
 }

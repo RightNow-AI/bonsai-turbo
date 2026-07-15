@@ -28,4 +28,11 @@ void dequant_row_dev_launch(int nbits, const uint8_t* codes, const __half* w_sca
                             const int32_t* d_row, int K, __half* out,
                             cudaStream_t stream);
 
+// fp32-output variants (embedding into the fp32 residual stream)
+void dequant_row_f32_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                            int row, int K, float* out, cudaStream_t stream);
+void dequant_row_f32_dev_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                                const int32_t* d_row, int K, float* out,
+                                cudaStream_t stream);
+
 }  // namespace bt

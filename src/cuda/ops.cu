@@ -37,6 +37,22 @@ __global__ void rmsnorm_kernel(const __half* __restrict__ x, const __half* __res
     }
 }
 
+__global__ void rmsnorm_f32_kernel(const float* __restrict__ x, const __half* __restrict__ w,
+                                   __half* __restrict__ y, int n, float eps) {
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    ss = block_reduce_sum(ss);
+    const float inv = rsqrtf(ss / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        y[i] = __float2half(x[i] * inv * __half2float(w[i]));
+    }
+}
+
+__global__ void add_f32_kernel(float* __restrict__ x, const float* __restrict__ d, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += d[i];
+}
+
 // one block per head
 __global__ void rmsnorm_heads_kernel(const __half* __restrict__ x, const __half* __restrict__ w,
                                      __half* __restrict__ y, int d, float eps) {
@@ -221,6 +237,15 @@ inline int blocks_for(int n) { return (n + kThreads - 1) / kThreads; }
 void rmsnorm_launch(const __half* x, const __half* w, __half* y, int n, float eps,
                     cudaStream_t stream) {
     rmsnorm_kernel<<<1, 1024, 0, stream>>>(x, w, y, n, eps);
+}
+
+void rmsnorm_f32_launch(const float* x, const __half* w, __half* y, int n, float eps,
+                        cudaStream_t stream) {
+    rmsnorm_f32_kernel<<<1, 1024, 0, stream>>>(x, w, y, n, eps);
+}
+
+void add_f32_launch(float* x, const float* d, int n, cudaStream_t stream) {
+    add_f32_kernel<<<blocks_for(n), kThreads, 0, stream>>>(x, d, n);
 }
 
 void rmsnorm_heads_launch(const __half* x, const __half* w, __half* y, int h, int d,

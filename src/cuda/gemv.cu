@@ -189,13 +189,13 @@ __global__ void gemv_kernel(const uint8_t* __restrict__ codes,
     }
 }
 
-// decode permuted codes of one row back to f16 (matches decode_permuted_* on CPU)
+// decode permuted codes of one row (matches decode_permuted_* on CPU)
 // ROW_PTR: row index read from device memory (CUDA-graph capturable)
-template <int NBITS, bool ROW_PTR = false>
+template <int NBITS, bool ROW_PTR, typename OUT>
 __global__ void dequant_row_kernel(const uint8_t* __restrict__ codes,
                                    const __half* __restrict__ w_scale, int row,
                                    const int32_t* __restrict__ d_row, int K,
-                                   __half* __restrict__ out) {
+                                   OUT* __restrict__ out) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;  // one thread per weight
     if (j >= K) return;
     if (ROW_PTR) row = *d_row;
@@ -203,20 +203,22 @@ __global__ void dequant_row_kernel(const uint8_t* __restrict__ codes,
     const uint8_t* rc = codes + (size_t)row * code_row_bytes;
     const float d = __half2float(w_scale[(size_t)row * (K >> 7) + (j >> 7)]);
 
+    float v;
     if (NBITS == 2) {
         // inverse of retile: code j = 16*(j/16) + 4i + b sits at bits [8b+2i]
         const int word = j >> 4, r = j & 15, i = r >> 2, b = r & 3;
         uint32_t w;
         memcpy(&w, rc + 4 * word, 4);
         const int q = (int)((w >> (8 * b + 2 * i)) & 3u);
-        out[j] = __float2half((float)(q - 1) * d);
+        v = (float)(q - 1) * d;
     } else {
         const int word = j >> 5, r = j & 31, i = r >> 2, b = r & 3;
         uint32_t w;
         memcpy(&w, rc + 4 * word, 4);
         const int bit = (int)((w >> (8 * b + i)) & 1u);
-        out[j] = __float2half(bit ? d : -d);
+        v = bit ? d : -d;
     }
+    out[j] = (OUT)v;
 }
 
 }  // namespace
@@ -225,15 +227,36 @@ void dequant_row_launch(int nbits, const uint8_t* codes, const __half* w_scale,
                         int row, int K, __half* out, cudaStream_t stream) {
     const int blocks = (K + 255) / 256;
     if (nbits == 2) {
-        dequant_row_kernel<2><<<blocks, 256, 0, stream>>>(codes, w_scale, row, nullptr, K, out);
+        dequant_row_kernel<2, false><<<blocks, 256, 0, stream>>>(codes, w_scale, row, nullptr, K, out);
     } else {
-        dequant_row_kernel<1><<<blocks, 256, 0, stream>>>(codes, w_scale, row, nullptr, K, out);
+        dequant_row_kernel<1, false><<<blocks, 256, 0, stream>>>(codes, w_scale, row, nullptr, K, out);
     }
 }
 
 void dequant_row_dev_launch(int nbits, const uint8_t* codes, const __half* w_scale,
                             const int32_t* d_row, int K, __half* out,
                             cudaStream_t stream) {
+    const int blocks = (K + 255) / 256;
+    if (nbits == 2) {
+        dequant_row_kernel<2, true><<<blocks, 256, 0, stream>>>(codes, w_scale, 0, d_row, K, out);
+    } else {
+        dequant_row_kernel<1, true><<<blocks, 256, 0, stream>>>(codes, w_scale, 0, d_row, K, out);
+    }
+}
+
+void dequant_row_f32_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                            int row, int K, float* out, cudaStream_t stream) {
+    const int blocks = (K + 255) / 256;
+    if (nbits == 2) {
+        dequant_row_kernel<2, false><<<blocks, 256, 0, stream>>>(codes, w_scale, row, nullptr, K, out);
+    } else {
+        dequant_row_kernel<1, false><<<blocks, 256, 0, stream>>>(codes, w_scale, row, nullptr, K, out);
+    }
+}
+
+void dequant_row_f32_dev_launch(int nbits, const uint8_t* codes, const __half* w_scale,
+                                const int32_t* d_row, int K, float* out,
+                                cudaStream_t stream) {
     const int blocks = (K + 255) / 256;
     if (nbits == 2) {
         dequant_row_kernel<2, true><<<blocks, 256, 0, stream>>>(codes, w_scale, 0, d_row, K, out);

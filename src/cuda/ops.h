@@ -12,6 +12,12 @@ namespace bt {
 void rmsnorm_launch(const __half* x, const __half* w, __half* y, int n,
                     float eps, cudaStream_t stream);
 
+// fp32-residual-stream variants: hidden state x stays fp32 end to end
+void rmsnorm_f32_launch(const float* x, const __half* w, __half* y, int n,
+                        float eps, cudaStream_t stream);
+// x[i] += d[i] (residual add straight from a GEMV's fp32 output)
+void add_f32_launch(float* x, const float* d, int n, cudaStream_t stream);
+
 // per-head RMS norm: h vectors of length d, same weight w[d] for every head
 void rmsnorm_heads_launch(const __half* x, const __half* w, __half* y, int h,
                           int d, float eps, cudaStream_t stream);
