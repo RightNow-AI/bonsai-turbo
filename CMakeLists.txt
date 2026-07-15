@@ -42,7 +42,10 @@ if(CMAKE_CUDA_COMPILER)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     message(STATUS "CUDA enabled (arch ${CMAKE_CUDA_ARCHITECTURES})")
 
-    add_library(bt_cuda src/cuda/gemv.cu)
+    add_library(bt_cuda
+        src/cuda/gemv.cu
+        src/cuda/ops.cu
+    )
     target_include_directories(bt_cuda PUBLIC src)
 
     add_executable(bt-microbench tools/bt_microbench.cu)
