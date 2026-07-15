@@ -36,7 +36,8 @@ __global__ void gdn_decode_kernel(const __half* __restrict__ q,
     }
     __syncthreads();
 
-    const float g = expf(-expf(A_log[h]) *
+    // ssm_a already stores -exp(A_log) (see fork qwen35.cpp: "-A_log.exp()")
+    const float g = expf(A_log[h] *
                          softplus_f(__half2float(alpha_raw[h]) + dt_bias[h]));
     const float beta = 1.f / (1.f + expf(-__half2float(beta_raw[h])));
 

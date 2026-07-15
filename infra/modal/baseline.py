@@ -31,9 +31,10 @@ cuda_image = (
     )
     .pip_install("huggingface_hub[hf_transfer]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-    # scripts are mounted fresh at runtime — editing them never rebuilds the image;
-    # the fork itself is compiled once by build_fork (32 CPUs) into the volume
+    # scripts/tools are mounted fresh at runtime — editing them never rebuilds
+    # the image; the fork itself is compiled once by build_fork into the volume
     .add_local_dir(REPO_ROOT / "scripts", "/repo/scripts")
+    .add_local_dir(REPO_ROOT / "tools", "/repo/tools")
 )
 
 hf_image = modal.Image.debian_slim(python_version="3.12").pip_install(
