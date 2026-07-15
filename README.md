@@ -10,8 +10,8 @@ collapsing the per-token pass into far fewer, fatter kernels.
 |---|---|---|---|
 | vendor fork (same machine class) | 85.5 ± 6.9 | 90.1 ± 3.5 | llama-bench tg128, pinned SHA; a second host measured 94.6 ternary |
 | vendor published | 98.0 | 104.8 | their model cards |
-| **bonsai-turbo (CUDA graph)** | **150.2** | **122.5** | 128 greedy tokens, one graph launch per token; 146.8-151.4 across containers |
-| bonsai-turbo (`--mega`, experimental) | 143.2 | — | whole token as ONE cooperative kernel launch; token-identical to graph mode |
+| **bonsai-turbo (CUDA graph)** | **151.1** | **122.5** | 128 greedy tokens, one graph launch per token; 146.8-151.4 across containers |
+| bonsai-turbo (`--mega`, experimental) | 144.7 | — | whole token as ONE cooperative kernel launch + idle-block L2 prefetch; token-identical to graph mode |
 
 Speedup, ternary: **1.76x** vs the vendor fork measured on identical hardware,
 **1.53x** vs their published H100 number. 1-bit: 1.36x / 1.17x (its GEMV inner
