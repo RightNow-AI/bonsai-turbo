@@ -102,74 +102,89 @@ __global__ void gemv_kernel(const uint8_t* __restrict__ codes,
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
-    const int sub = lane / 8;   // row within the warp's quad
-    const int li = lane & 7;    // lane within the row's 8-lane team
 
-    const int row = blockIdx.x * 32 + warp * 4 + sub;
-    if (row >= M) return;
+    // warp covers 4 rows; all 32 lanes stride the chunk range together, so
+    // code loads are 512B-coalesced per row and the activation chunk is cached
+    // in registers once and reused across the 4 rows (4x less smem traffic).
+    const int row0 = blockIdx.x * 32 + warp * 4;
+    if (row0 >= M) return;
+    const int nrows = min(4, M - row0);
 
-    const uint4* row_codes = reinterpret_cast<const uint4*>(codes + (size_t)row * code_row_bytes);
-    const __half* row_scale = w_scale + (size_t)row * (K >> 7);
+    const uint4* rc[4];
+    const __half* rs[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int row = row0 + (r < nrows ? r : 0);  // clamp; extras discarded
+        rc[r] = reinterpret_cast<const uint4*>(codes + (size_t)row * code_row_bytes);
+        rs[r] = w_scale + (size_t)row * (K >> 7);
+    }
 
-    float acc = 0.f;
-    for (int c = c0 + li; c < c1; c += 8) {
-        const uint4 cw = row_codes[c];
-        const uint32_t cws[4] = {cw.x, cw.y, cw.z, cw.w};
-        // one accumulator per code word: 4 independent dp4a chains (ILP),
-        // summed once per chunk
-        int dots[4] = {0, 0, 0, 0};
-
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int c = c0 + lane; c < c1; c += 32) {
         if (NBITS == 2) {
             // chunk c covers codes [64c, 64c+64) = activation bytes [64c, 64c+64)
             const uint4* aw = reinterpret_cast<const uint4*>(s_a8 + c * 64 - a_byte0);
-#pragma unroll
-            for (int wnum = 0; wnum < 4; ++wnum) {
-                const uint4 av = aw[wnum];
-                const uint32_t w = cws[wnum];
-                dots[wnum] = dp4a_u8s8(w & 0x03030303u, av.x, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 2) & 0x03030303u, av.y, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 4) & 0x03030303u, av.z, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 6) & 0x03030303u, av.w, dots[wnum]);
-            }
-            const int dot = (dots[0] + dots[1]) + (dots[2] + dots[3]);
+            const uint4 av[4] = {aw[0], aw[1], aw[2], aw[3]};
             const int g = c >> 1;  // 2 chunks per 128-group
-            const float wd = __half2float(row_scale[g]);
-            acc += wd * s_scale[g - g0] * (float)(dot - s_gsum[c - 2 * g0]);
+            const float as = s_scale[g - g0];
+            const int gs = s_gsum[c - 2 * g0];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const uint4 cw = rc[r][c];
+                const uint32_t cws[4] = {cw.x, cw.y, cw.z, cw.w};
+                int dot = 0;
+#pragma unroll
+                for (int wnum = 0; wnum < 4; ++wnum) {
+                    const uint32_t w = cws[wnum];
+                    dot = dp4a_u8s8(w & 0x03030303u, av[wnum].x, dot);
+                    dot = dp4a_u8s8((w >> 2) & 0x03030303u, av[wnum].y, dot);
+                    dot = dp4a_u8s8((w >> 4) & 0x03030303u, av[wnum].z, dot);
+                    dot = dp4a_u8s8((w >> 6) & 0x03030303u, av[wnum].w, dot);
+                }
+                acc[r] += __half2float(rs[r][g]) * as * (float)(dot - gs);
+            }
         } else {
             // chunk c covers codes [128c, 128c+128) = one full group
             const uint4* aw = reinterpret_cast<const uint4*>(s_a8 + c * 128 - a_byte0);
-#pragma unroll
-            for (int wnum = 0; wnum < 4; ++wnum) {
-                const uint32_t w = cws[wnum];
-                const uint4 av0 = aw[wnum * 2];
-                const uint4 av1 = aw[wnum * 2 + 1];
-                dots[wnum] = dp4a_u8s8(w & 0x01010101u, av0.x, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 1) & 0x01010101u, av0.y, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 2) & 0x01010101u, av0.z, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 3) & 0x01010101u, av0.w, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 4) & 0x01010101u, av1.x, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 5) & 0x01010101u, av1.y, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 6) & 0x01010101u, av1.z, dots[wnum]);
-                dots[wnum] = dp4a_u8s8((w >> 7) & 0x01010101u, av1.w, dots[wnum]);
-            }
-            const int dot = (dots[0] + dots[1]) + (dots[2] + dots[3]);
+            const uint4 av[8] = {aw[0], aw[1], aw[2], aw[3], aw[4], aw[5], aw[6], aw[7]};
             const int g = c;
-            const float wd = __half2float(row_scale[g]);
-            const int gsum = s_gsum[2 * (c - g0)] + s_gsum[2 * (c - g0) + 1];
-            acc += wd * s_scale[g - g0] * (float)(2 * dot - gsum);
+            const float as = s_scale[g - g0];
+            const int gs = s_gsum[2 * (c - g0)] + s_gsum[2 * (c - g0) + 1];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const uint4 cw = rc[r][c];
+                const uint32_t cws[4] = {cw.x, cw.y, cw.z, cw.w};
+                int dot = 0;
+#pragma unroll
+                for (int wnum = 0; wnum < 4; ++wnum) {
+                    const uint32_t w = cws[wnum];
+                    dot = dp4a_u8s8(w & 0x01010101u, av[wnum * 2].x, dot);
+                    dot = dp4a_u8s8((w >> 1) & 0x01010101u, av[wnum * 2].y, dot);
+                    dot = dp4a_u8s8((w >> 2) & 0x01010101u, av[wnum * 2].z, dot);
+                    dot = dp4a_u8s8((w >> 3) & 0x01010101u, av[wnum * 2].w, dot);
+                    dot = dp4a_u8s8((w >> 4) & 0x01010101u, av[wnum * 2 + 1].x, dot);
+                    dot = dp4a_u8s8((w >> 5) & 0x01010101u, av[wnum * 2 + 1].y, dot);
+                    dot = dp4a_u8s8((w >> 6) & 0x01010101u, av[wnum * 2 + 1].z, dot);
+                    dot = dp4a_u8s8((w >> 7) & 0x01010101u, av[wnum * 2 + 1].w, dot);
+                }
+                acc[r] += __half2float(rs[r][g]) * as * (float)(2 * dot - gs);
+            }
         }
     }
 
-    // reduce across the row's 8-lane team
+    // full-warp reduce per row
 #pragma unroll
-    for (int off = 4; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
-    }
-    if (li == 0) {
-        if constexpr (SPLIT) {
-            atomicAdd(&y[row], acc);
-        } else {
-            y[row] = acc;
+    for (int r = 0; r < 4; ++r) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[r] += __shfl_down_sync(0xFFFFFFFFu, acc[r], off);
+        }
+        if (lane == 0 && r < nrows) {
+            if constexpr (SPLIT) {
+                atomicAdd(&y[row0 + r], acc[r]);
+            } else {
+                y[row0 + r] = acc[r];
+            }
         }
     }
 }
@@ -188,10 +203,11 @@ void gemv_launch(int nbits, const uint8_t* codes, const __half* w_scale,
                  const int8_t* a8, const float* a_scale, const int32_t* a_gsum64,
                  float* y, int M, int K, cudaStream_t stream) {
     const int row_blocks = (M + 31) / 32;
-    // fill the GPU: aim for ~1024 blocks, but never slice below 8 chunks/split
+    // fill the GPU: aim for ~1024 blocks, but keep >=32 chunks per split so
+    // every lane of the chunk-striding warps has work
     const int chunks = (nbits == 2 ? K / 4 : K / 8) / 16;
     int splits = 1024 / row_blocks;
-    splits = max(1, min(splits, chunks / 8));
+    splits = max(1, min(splits, chunks / 32));
     const int cps = ((chunks + splits - 1) / splits + 1) & ~1;
     const int a_slice = cps * (nbits == 2 ? 64 : 128);
     const int smem = a_slice + (a_slice / 128) * 4 + (a_slice / 64) * 4;
