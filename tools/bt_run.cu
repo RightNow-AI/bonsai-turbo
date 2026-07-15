@@ -78,8 +78,9 @@ struct Runtime {
     void alloc() {
         const HParams& hp = m.hp;
         CUDA_CHECK(cudaStreamCreate(&st));
-        const int big = std::max({hp.n_ff, qkv_dim(), 2 * hp.head_dim * hp.n_head,
-                                  hp.ssm_inner, hp.n_embd});
+        const int big = std::max({2 * hp.n_ff, qkv_dim() + hp.ssm_inner + 256,
+                                  2 * hp.head_dim * hp.n_head + hp.n_head_kv * hp.head_dim * 2,
+                                  hp.n_embd});
         const int max_k = std::max({hp.n_embd, hp.ssm_inner, hp.n_ff,
                                     hp.head_dim * hp.n_head});
         CUDA_CHECK(cudaMalloc(&x, hp.n_embd * 4));
@@ -180,24 +181,23 @@ void gdn_layer(Runtime& rt, int il) {
     probe_vec(rt, "attn_norm", il, rt.xn, hp.n_embd);
     rt.quant(rt.xn, hp.n_embd);
 
-    rt.mv_f16out(l.ssm_in, rt.xn, rt.y32, rt.big_a);
-    rt.mv_f16out(l.ssm_gate, rt.xn, rt.y32, rt.big_b);
-    probe_vec(rt, "qkv_mixed", il, rt.big_a, rt.qkv_dim());
-    probe_vec(rt, "z", il, rt.big_b, hp.ssm_inner);
-    __half* alpha_raw = rt.gdn_out;
-    __half* beta_raw = rt.gdn_out + Hv;
-    rt.mv_f16out(l.ssm_alpha, rt.xn, rt.y32, alpha_raw);
-    rt.mv_f16out(l.ssm_beta, rt.xn, rt.y32, beta_raw);
-    probe_vec(rt, "alpha_raw", il, alpha_raw, Hv);
-    probe_vec(rt, "beta_raw", il, beta_raw, Hv);
+    // fused [qkv_mixed | z | alpha | beta] projection: one GEMV, one cast
+    rt.mv16(l.gdn_fused, rt.xn, rt.y32);
+    f32_to_f16_launch(rt.y32, rt.big_a, l.gdn_fused.M, rt.st);
+    __half* qkv_mixed = rt.big_a;
+    __half* z = rt.big_a + l.ssm_in_rows;
+    __half* alpha_raw = z + l.ssm_gate_rows;
+    __half* beta_raw = alpha_raw + Hv;
+    probe_vec(rt, "qkv_mixed", il, qkv_mixed, rt.qkv_dim());
+    probe_vec(rt, "z", il, z, hp.ssm_inner);
 
-    conv1d_step_launch(rt.big_a, l.conv_w, rt.conv_state[(size_t)il], rt.big_a,
+    conv1d_step_launch(qkv_mixed, l.conv_w, rt.conv_state[(size_t)il], qkv_mixed,
                        rt.qkv_dim(), hp.ssm_conv, rt.st);
-    probe_vec(rt, "conv_output_silu", il, rt.big_a, rt.qkv_dim());
+    probe_vec(rt, "conv_output_silu", il, qkv_mixed, rt.qkv_dim());
 
-    __half* qc = rt.big_a;
-    __half* kc = rt.big_a + (size_t)Sk * Hk;
-    __half* vc = rt.big_a + (size_t)2 * Sk * Hk;
+    __half* qc = qkv_mixed;
+    __half* kc = qkv_mixed + (size_t)Sk * Hk;
+    __half* vc = qkv_mixed + (size_t)2 * Sk * Hk;
     l2norm_heads_launch(qc, qc, Hk, Sk, hp.rms_eps, rt.st);
     l2norm_heads_launch(kc, kc, Hk, Sk, hp.rms_eps, rt.st);
     probe_vec(rt, "q_conv_l2", il, qc, Sk * Hk);
@@ -209,7 +209,7 @@ void gdn_layer(Runtime& rt, int il) {
     probe_vec(rt, "gdn_core_out", il, rt.attn_out, hp.ssm_inner);
 
     rmsnorm_heads_launch(rt.attn_out, l.ssm_norm, rt.attn_out, Hv, Sv, hp.rms_eps, rt.st);
-    silu_mul_launch(rt.big_b, rt.attn_out, rt.attn_out, hp.ssm_inner, rt.st);
+    silu_mul_launch(z, rt.attn_out, rt.attn_out, hp.ssm_inner, rt.st);
     probe_vec(rt, "final_output", il, rt.attn_out, hp.ssm_inner);
 
     rt.quant(rt.attn_out, hp.ssm_inner);
@@ -225,33 +225,36 @@ void attn_layer(Runtime& rt, int il) {
     rmsnorm_f32_launch(rt.x, l.attn_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
     rt.quant(rt.xn, hp.n_embd);
 
-    rt.mv_f16out(l.wq, rt.xn, rt.y32, rt.big_a);  // [H][2D] interleaved q|gate
-    rt.mv_f16out(l.wk, rt.xn, rt.y32, rt.k);
-    rt.mv_f16out(l.wv, rt.xn, rt.y32, rt.v);
+    // fused [q+gate | k | v] projection: one GEMV, one cast
+    rt.mv16(l.qkv_fused, rt.xn, rt.y32);
+    f32_to_f16_launch(rt.y32, rt.big_a, l.qkv_fused.M, rt.st);
+    __half* qg = rt.big_a;                       // [H][2D] interleaved q|gate
+    __half* kk = rt.big_a + l.wq_rows;
+    __half* vv = kk + l.wk_rows;
 
-    gather_heads_launch(rt.big_a, rt.q, H, D, 2 * D, 0, rt.st);
-    gather_heads_launch(rt.big_a, rt.big_b, H, D, 2 * D, D, rt.st);  // gate
+    gather_heads_launch(qg, rt.q, H, D, 2 * D, 0, rt.st);
+    gather_heads_launch(qg, rt.big_b, H, D, 2 * D, D, rt.st);  // gate
 
     rmsnorm_heads_launch(rt.q, l.q_norm, rt.q, H, D, hp.rms_eps, rt.st);
-    rmsnorm_heads_launch(rt.k, l.k_norm, rt.k, Hkv, D, hp.rms_eps, rt.st);
+    rmsnorm_heads_launch(kk, l.k_norm, kk, Hkv, D, hp.rms_eps, rt.st);
 
     const int kv_elems = Hkv * D;
     if (rt.graph_mode) {
         rope_neox_dev_launch(rt.q, H, D, hp.n_rot, rt.d_pos, hp.rope_base, rt.st);
-        rope_neox_dev_launch(rt.k, Hkv, D, hp.n_rot, rt.d_pos, hp.rope_base, rt.st);
-        kv_append_dev_launch(rt.k, rt.v, rt.k_cache[(size_t)il], rt.v_cache[(size_t)il],
+        rope_neox_dev_launch(kk, Hkv, D, hp.n_rot, rt.d_pos, hp.rope_base, rt.st);
+        kv_append_dev_launch(kk, vv, rt.k_cache[(size_t)il], rt.v_cache[(size_t)il],
                              kv_elems, rt.d_pos, rt.st);
         attn_decode_dev_launch(rt.q, rt.k_cache[(size_t)il], rt.v_cache[(size_t)il],
                                rt.attn_out, H, Hkv, D, rt.d_pos,
                                1.f / sqrtf((float)D), rt.st);
     } else {
         rope_neox_launch(rt.q, H, D, hp.n_rot, rt.pos, hp.rope_base, rt.st);
-        rope_neox_launch(rt.k, Hkv, D, hp.n_rot, rt.pos, hp.rope_base, rt.st);
+        rope_neox_launch(kk, Hkv, D, hp.n_rot, rt.pos, hp.rope_base, rt.st);
         CUDA_CHECK(cudaMemcpyAsync(rt.k_cache[(size_t)il] + (size_t)rt.pos * kv_elems,
-                                   rt.k, (size_t)kv_elems * 2,
+                                   kk, (size_t)kv_elems * 2,
                                    cudaMemcpyDeviceToDevice, rt.st));
         CUDA_CHECK(cudaMemcpyAsync(rt.v_cache[(size_t)il] + (size_t)rt.pos * kv_elems,
-                                   rt.v, (size_t)kv_elems * 2,
+                                   vv, (size_t)kv_elems * 2,
                                    cudaMemcpyDeviceToDevice, rt.st));
         attn_decode_launch(rt.q, rt.k_cache[(size_t)il], rt.v_cache[(size_t)il],
                            rt.attn_out, H, Hkv, D, rt.pos + 1,
@@ -270,9 +273,9 @@ void mlp(Runtime& rt, int il) {
     const Layer& l = rt.m.layers[(size_t)il];
     rmsnorm_f32_launch(rt.x, l.attn_post_norm, rt.xn, hp.n_embd, hp.rms_eps, rt.st);
     rt.quant(rt.xn, hp.n_embd);
-    rt.mv_f16out(l.gate, rt.xn, rt.y32, rt.big_a);
-    rt.mv_f16out(l.up, rt.xn, rt.y32, rt.big_b);
-    silu_mul_launch(rt.big_a, rt.big_b, rt.big_a, hp.n_ff, rt.st);
+    rt.mv16(l.gate_up, rt.xn, rt.y32);
+    f32_to_f16_launch(rt.y32, rt.big_a, l.gate_up.M, rt.st);
+    silu_mul_launch(rt.big_a, rt.big_a + l.gate_rows, rt.big_a, hp.n_ff, rt.st);
     rt.quant(rt.big_a, hp.n_ff);
     rt.mv16(l.down, rt.big_a, rt.y32);
     add_f32_launch(rt.x, rt.y32, hp.n_embd, rt.st);

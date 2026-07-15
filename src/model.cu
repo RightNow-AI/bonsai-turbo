@@ -132,6 +132,25 @@ struct Loader {
         return dev;
     }
 
+    RetiledTensor retile(const TensorInfo& t) const {
+        int64_t rows, cols;
+        tensor_rows_cols(t, rows, cols);
+        if (t.type == GGMLType::Q2_0) {
+            const auto* blocks = reinterpret_cast<const BlockQ2_0*>(f.tensor_data(t));
+            const int64_t c3 = count_q2_0_code3(blocks, rows * cols);
+            if (c3 != 0) {
+                throw std::runtime_error(t.name + ": " + std::to_string(c3) +
+                                         " code-3 (+2d) elements; pack not ternary");
+            }
+            return retile_q2_0(blocks, rows, cols);
+        }
+        if (t.type == GGMLType::Q1_0) {
+            return retile_q1_0(reinterpret_cast<const BlockQ1_0*>(f.tensor_data(t)),
+                               rows, cols);
+        }
+        throw std::runtime_error("expected quantized tensor: " + t.name);
+    }
+
     Mat mat(const TensorInfo& t) const {
         Mat m;
         int64_t rows, cols;
@@ -140,18 +159,7 @@ struct Loader {
         m.K = (int)cols;
         if (t.type == GGMLType::Q2_0 || t.type == GGMLType::Q1_0) {
             m.nbits = t.type == GGMLType::Q2_0 ? 2 : 1;
-            RetiledTensor rt;
-            if (m.nbits == 2) {
-                const auto* blocks = reinterpret_cast<const BlockQ2_0*>(f.tensor_data(t));
-                const int64_t c3 = count_q2_0_code3(blocks, rows * cols);
-                if (c3 != 0) {
-                    throw std::runtime_error(t.name + ": " + std::to_string(c3) +
-                                             " code-3 (+2d) elements; pack not ternary");
-                }
-                rt = retile_q2_0(blocks, rows, cols);
-            } else {
-                rt = retile_q1_0(reinterpret_cast<const BlockQ1_0*>(f.tensor_data(t)), rows, cols);
-            }
+            RetiledTensor rt = retile(t);
             BT_CUDA(cudaMalloc(&m.codes, rt.codes.size()));
             BT_CUDA(cudaMemcpy(m.codes, rt.codes.data(), rt.codes.size(), cudaMemcpyHostToDevice));
             BT_CUDA(cudaMalloc(&m.scales, rt.scales.size() * 2));
@@ -160,6 +168,47 @@ struct Loader {
         } else {
             m.nbits = 16;
             m.dense = f16(t);
+        }
+        return m;
+    }
+
+    // stack same-K quantized tensors row-wise into one device matrix
+    Mat mat_stacked(const std::vector<const TensorInfo*>& ts) const {
+        Mat m;
+        size_t code_bytes = 0, scale_elems = 0;
+        int64_t rows_total = 0, cols = 0;
+        int nbits = 0;
+        for (const TensorInfo* t : ts) {
+            int64_t r, c;
+            tensor_rows_cols(*t, r, c);
+            const int nb = t->type == GGMLType::Q2_0 ? 2
+                           : t->type == GGMLType::Q1_0 ? 1 : 0;
+            if (nb == 0) throw std::runtime_error("stack: not quantized: " + t->name);
+            if (cols == 0) {
+                cols = c;
+                nbits = nb;
+            }
+            if (c != cols || nb != nbits) {
+                throw std::runtime_error("stack: K/type mismatch at " + t->name);
+            }
+            rows_total += r;
+            code_bytes += (size_t)(r * (nbits == 2 ? c / 4 : c / 8));
+            scale_elems += (size_t)(r * (c / 128));
+        }
+        m.nbits = nbits;
+        m.M = (int)rows_total;
+        m.K = (int)cols;
+        BT_CUDA(cudaMalloc(&m.codes, code_bytes));
+        BT_CUDA(cudaMalloc(&m.scales, scale_elems * 2));
+        size_t co = 0, so = 0;
+        for (const TensorInfo* t : ts) {
+            RetiledTensor rt = retile(*t);
+            BT_CUDA(cudaMemcpy(m.codes + co, rt.codes.data(), rt.codes.size(),
+                               cudaMemcpyHostToDevice));
+            BT_CUDA(cudaMemcpy(m.scales + so, rt.scales.data(), rt.scales.size() * 2,
+                               cudaMemcpyHostToDevice));
+            co += rt.codes.size();
+            so += rt.scales.size();
         }
         return m;
     }
@@ -229,18 +278,27 @@ void Model::load(const std::string& path) {
         l.attn_post_norm = L.f16(L.need({blk(il, "post_attention_norm.weight"),
                                          blk(il, "ffn_norm.weight"),
                                          blk(il, "attn_post_norm.weight")}));
-        l.up = L.mat(L.need({blk(il, "ffn_up.weight")}));
-        l.gate = L.mat(L.need({blk(il, "ffn_gate.weight")}));
+        const TensorInfo& t_gate = L.need({blk(il, "ffn_gate.weight")});
+        const TensorInfo& t_up = L.need({blk(il, "ffn_up.weight")});
+        l.gate_up = L.mat_stacked({&t_gate, &t_up});
+        int64_t r, c;
+        tensor_rows_cols(t_gate, r, c);
+        l.gate_rows = (int)r;
         l.down = L.mat(L.need({blk(il, "ffn_down.weight")}));
 
         if (l.recurrent) {
             // Bonsai 27B names these attn_qkv/attn_gate even on delta-net layers
-            l.ssm_in = L.mat(L.need({blk(il, "attn_qkv.weight"), blk(il, "ssm_in.weight")}));
-            l.ssm_gate = L.mat(L.need({blk(il, "attn_gate.weight"),
-                                       blk(il, "ssm_in_gate.weight"),
-                                       blk(il, "ssm_gate.weight")}));
-            l.ssm_beta = L.mat(L.need({blk(il, "ssm_beta.weight")}));
-            l.ssm_alpha = L.mat(L.need({blk(il, "ssm_alpha.weight")}));
+            const TensorInfo& t_in = L.need({blk(il, "attn_qkv.weight"), blk(il, "ssm_in.weight")});
+            const TensorInfo& t_z = L.need({blk(il, "attn_gate.weight"),
+                                            blk(il, "ssm_in_gate.weight"),
+                                            blk(il, "ssm_gate.weight")});
+            const TensorInfo& t_alpha = L.need({blk(il, "ssm_alpha.weight")});
+            const TensorInfo& t_beta = L.need({blk(il, "ssm_beta.weight")});
+            l.gdn_fused = L.mat_stacked({&t_in, &t_z, &t_alpha, &t_beta});
+            tensor_rows_cols(t_in, r, c);
+            l.ssm_in_rows = (int)r;
+            tensor_rows_cols(t_z, r, c);
+            l.ssm_gate_rows = (int)r;
             l.ssm_out = L.mat(L.need({blk(il, "ssm_out.weight")}));
             l.ssm_norm = L.f16(L.need({blk(il, "ssm_norm.weight")}));
             l.ssm_a = L.f32(L.need({blk(il, "ssm_a")}));
@@ -252,9 +310,16 @@ void Model::load(const std::string& path) {
             hp.conv_channels = (int)rows;  // ne[0] = kernel width, rows = channels
             if (hp.ssm_conv != (int)cols) hp.ssm_conv = (int)cols;
         } else {
-            l.wq = L.mat(L.need({blk(il, "attn_q.weight")}));
-            l.wk = L.mat(L.need({blk(il, "attn_k.weight")}));
-            l.wv = L.mat(L.need({blk(il, "attn_v.weight")}));
+            const TensorInfo& t_q = L.need({blk(il, "attn_q.weight")});
+            const TensorInfo& t_k = L.need({blk(il, "attn_k.weight")});
+            const TensorInfo& t_v = L.need({blk(il, "attn_v.weight")});
+            l.qkv_fused = L.mat_stacked({&t_q, &t_k, &t_v});
+            tensor_rows_cols(t_q, r, c);
+            l.wq_rows = (int)r;
+            tensor_rows_cols(t_k, r, c);
+            l.wk_rows = (int)r;
+            tensor_rows_cols(t_v, r, c);
+            l.wv_rows = (int)r;
             l.wo = L.mat(L.need({blk(il, "attn_output.weight")}));
             l.q_norm = L.f16(L.need({blk(il, "attn_q_norm.weight")}));
             l.k_norm = L.f16(L.need({blk(il, "attn_k_norm.weight")}));
@@ -271,7 +336,9 @@ void Model::load(const std::string& path) {
     }
     for (const Layer& l : layers) {
         if (l.recurrent) {
-            if (hp.ssm_dt_rank == 0) hp.ssm_dt_rank = l.ssm_beta.M;
+            if (hp.ssm_dt_rank == 0) {
+                hp.ssm_dt_rank = (l.gdn_fused.M - l.ssm_in_rows - l.ssm_gate_rows) / 2;
+            }
             break;
         }
     }

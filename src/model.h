@@ -38,16 +38,19 @@ struct Mat {
 struct Layer {
     bool recurrent = false;
     __half *attn_norm = nullptr, *attn_post_norm = nullptr;
-    // full attention
-    Mat wq, wk, wv, wo;
+    // full attention: fused [q|k|v] projection (rows stacked; same K) + out
+    Mat qkv_fused, wo;
+    int wq_rows = 0, wk_rows = 0, wv_rows = 0;
     __half *q_norm = nullptr, *k_norm = nullptr;
-    // gated delta net
-    Mat ssm_in, ssm_gate, ssm_beta, ssm_alpha, ssm_out;
+    // gated delta net: fused [qkv_mixed|z|alpha|beta] projection + out
+    Mat gdn_fused, ssm_out;
+    int ssm_in_rows = 0, ssm_gate_rows = 0;  // then H_v alpha + H_v beta
     __half* ssm_norm = nullptr;  // [head_v_dim]
     float *ssm_a = nullptr, *ssm_dt = nullptr;  // [H_v]
     __half* conv_w = nullptr;                   // [C][k]
-    // mlp
-    Mat up, gate, down;
+    // mlp: fused [gate|up] + down
+    Mat gate_up, down;
+    int gate_rows = 0;
 };
 
 struct Model {
