@@ -35,7 +35,9 @@ run_one () {
 
 run_one "$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf" ternary_eager
 run_one "$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf" ternary_graph --graph
+run_one "$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf" ternary_mega --mega
 run_one "$WEIGHTS_DIR/Bonsai-27B-Q1_0.gguf" onebit_eager
 run_one "$WEIGHTS_DIR/Bonsai-27B-Q1_0.gguf" onebit_graph --graph
+run_one "$WEIGHTS_DIR/Bonsai-27B-Q1_0.gguf" onebit_mega --mega
 
 echo "== raw results in $OUT_DIR"

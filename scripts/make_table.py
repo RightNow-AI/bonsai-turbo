@@ -39,17 +39,19 @@ def main():
     gpu = raw / "gpu_info.csv"
     if gpu.exists():
         out += ["GPU under test: " + gpu.read_text().strip().splitlines()[-1], ""]
-    out += ["| pack | vendor fork (measured) | bonsai-turbo eager | bonsai-turbo graph | speedup vs measured | vendor published |",
-            "|---|---|---|---|---|---|"]
+    out += ["| pack | vendor fork (measured) | eager | CUDA graph | megakernel | best speedup | vendor published |",
+            "|---|---|---|---|---|---|---|"]
     for pack in ("ternary", "onebit"):
         v = vendor_tg(raw, f"{pack}_default")
         oe = ours_tg(raw, f"{pack}_eager")
         og = ours_tg(raw, f"{pack}_graph")
-        best = max([x for x in (oe, og) if x], default=None)
+        om = ours_tg(raw, f"{pack}_mega")
+        best = max([x for x in (oe, og, om) if x], default=None)
         speedup = f"{best / v[0]:.2f}x" if v and best else "-"
         out.append(
             f"| {pack} | {f'{v[0]:.1f} +/- {v[1]:.1f}' if v else '-'} "
             f"| {f'{oe:.1f}' if oe else '-'} | {f'{og:.1f}' if og else '-'} "
+            f"| {f'{om:.1f}' if om else '-'} "
             f"| {speedup} | {VENDOR_PUBLISHED[pack]:.1f} |")
     trace = raw / "trace_summary.json"
     if trace.exists():

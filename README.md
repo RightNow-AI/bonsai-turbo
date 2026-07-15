@@ -91,7 +91,17 @@ cmake -B build -G Ninja && cmake --build build -j
 ctest --test-dir build
 ./build/bt-inspect weights/Ternary-Bonsai-27B-Q2_0.gguf --scan-code3
 ./build/bt-microbench                   # GEMV bandwidth + correctness
+
+# 4. decode (token ids in/out; tokenize with the fork's llama-tokenize)
+./build/bt-run --model weights/Ternary-Bonsai-27B-Q2_0.gguf \
+    --ids 9707 --n 128 --bench --graph   # or --mega for the single-launch engine
+
+# 5. gates + full comparison table
+./scripts/parity.sh                     # logit parity vs the fork, 32 prompts
+./scripts/bench_ours.sh && python3 scripts/make_table.py
 ```
+
+Or everything in one shot: `./scripts/repro.sh`.
 
 Maintainers run the same scripts on cloud GPUs via thin wrappers in
 `infra/modal/`; nothing in the engine depends on them.
