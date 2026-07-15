@@ -38,7 +38,8 @@ namespace {
 
 struct Runtime {
     Model m;
-    int max_ctx = 4096;
+    int max_ctx = 8192;
+    int eos = -1;  // stop generation at this token if >= 0
 
     // activation buffers (f16 unless noted)
     __half *x, *xn, *big_a, *big_b, *q, *k, *v, *attn_out, *gdn_out;
@@ -310,6 +311,7 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
         argmax_launch(rt.y32, hp.vocab, d_tok, 0);
         CUDA_CHECK(cudaMemcpy(&tok, d_tok, 4, cudaMemcpyDeviceToHost));
         std::printf(" %d", tok);
+        if (tok == rt.eos) break;
         decode(rt, tok);
     }
     CUDA_CHECK(cudaEventRecord(t1));
@@ -331,6 +333,7 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
 int main(int argc, char** argv) {
     std::string model_path, ids_str, ids_file, logits_out;
     int n_gen = 32;
+    int eos = -1;
     bool bench = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -340,6 +343,7 @@ int main(int argc, char** argv) {
         else if (a == "--n" && i + 1 < argc) n_gen = std::atoi(argv[++i]);
         else if (a == "--logits-out" && i + 1 < argc) logits_out = argv[++i];
         else if (a == "--bench") bench = true;
+        else if (a == "--eos" && i + 1 < argc) eos = std::atoi(argv[++i]);
     }
     if (model_path.empty() || (ids_str.empty() && ids_file.empty())) {
         std::fprintf(stderr,
@@ -361,6 +365,7 @@ int main(int argc, char** argv) {
                  hp.ssm_groups, hp.ssm_state, hp.ssm_dt_rank, hp.head_v_dim,
                  hp.ssm_conv, hp.conv_channels);
     rt.alloc();
+    rt.eos = eos;
 
     if (!ids_str.empty()) {
         run_prompt(rt, parse_ids(ids_str), n_gen, logits_out, bench);
