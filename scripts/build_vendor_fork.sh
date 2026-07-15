@@ -48,7 +48,7 @@ cmake -S "$FORK_DIR" -B "$FORK_DIR/build" "${GEN[@]}" \
     -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
     -DLLAMA_CURL=OFF
 
-cmake --build "$FORK_DIR/build" -j "$(nproc)" --target llama-bench llama-cli llama-tokenize
+cmake --build "$FORK_DIR/build" -j "$(nproc)" --target llama-bench llama-cli llama-tokenize llama-eval-callback
 
 echo "== vendor fork built at $FORK_SHA"
 "$FORK_DIR/build/bin/llama-bench" --version 2>&1 || true

@@ -129,12 +129,28 @@ def speed(n_gen: int = 128, model: str = "ternary") -> str:
     return "\n".join(out)
 
 
+@app.function(image=cuda_dev_image, gpu="H100", memory=32768, volumes={"/data": data_vol}, timeout=1800)
+def debug_probe(ids: str = "9707", n: int = 2, model: str = "ternary") -> str:
+    import os
+
+    _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
+    _sh(["cmake", "--build", "/tmp/build", "-j"])
+    proc = subprocess.run(
+        ["/tmp/build/bt-run", "--model", MODELS[model], "--ids", ids, "--n", str(n)],
+        env={**os.environ, "BT_PROBE": "1"}, capture_output=True, text=True)
+    out = proc.stdout + "\n--- stderr ---\n" + proc.stderr
+    print(out)
+    return out
+
+
 @app.local_entrypoint()
 def main(inspect: str = "", scan: bool = False, gpu: bool = False,
          shapes: str = "", gguf: str = "", tensor: str = "",
-         run_parity: bool = False, run_speed: bool = False,
+         run_parity: bool = False, run_speed: bool = False, run_probe: bool = False,
          n_gen: int = 64, model: str = "ternary"):
-    if run_parity:
+    if run_probe:
+        print(debug_probe.remote(model=model))
+    elif run_parity:
         print(parity.remote(n_gen=n_gen, model=model))
     elif run_speed:
         print(speed.remote(n_gen=max(n_gen, 128), model=model))
