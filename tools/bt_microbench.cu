@@ -94,7 +94,7 @@ BenchResult run_case(int nbits, const Block* blocks, int64_t M, int64_t K) {
     CUDA_CHECK(cudaMalloc(&d_x, (size_t)K * 2));
     CUDA_CHECK(cudaMalloc(&d_a8, (size_t)K));
     CUDA_CHECK(cudaMalloc(&d_ascale, groups * 4));
-    CUDA_CHECK(cudaMalloc(&d_gsum, groups * 4));
+    CUDA_CHECK(cudaMalloc(&d_gsum, groups * 2 * 4));  // half-group (64) sums
     CUDA_CHECK(cudaMalloc(&d_y, (size_t)M * 4));
     CUDA_CHECK(cudaMemcpy(d_codes, t.codes.data(), t.codes.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_scales, t.scales.data(), t.scales.size() * 2, cudaMemcpyHostToDevice));
@@ -106,10 +106,8 @@ BenchResult run_case(int nbits, const Block* blocks, int64_t M, int64_t K) {
     // pull the GPU's own quantization for exact-pipeline emulation
     std::vector<int8_t> a8((size_t)K);
     std::vector<float> ascale((size_t)groups);
-    std::vector<int32_t> gsum((size_t)groups);
     CUDA_CHECK(cudaMemcpy(a8.data(), d_a8, (size_t)K, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ascale.data(), d_ascale, groups * 4, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(gsum.data(), d_gsum, groups * 4, cudaMemcpyDeviceToHost));
 
     gemv_launch(nbits, d_codes, d_scales, d_a8, d_ascale, d_gsum, d_y, (int)M, (int)K, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -130,19 +128,19 @@ BenchResult run_case(int nbits, const Block* blocks, int64_t M, int64_t K) {
         }
         double ref_int8 = 0, ref_fp = 0;
         for (int64_t g = 0; g < groups; ++g) {
+            // NOTE: half bits -> float must go through half_to_float; __half2float
+            // on the raw uint16 would convert the integer value.
+            const double wd = half_to_float(
+                (std::is_same_v<Block, BlockQ2_0>)
+                    ? reinterpret_cast<const BlockQ2_0*>(blocks)[r * groups + g].d
+                    : reinterpret_cast<const BlockQ1_0*>(blocks)[r * groups + g].d);
             long long dot = 0;
-            double wd = 0;
             for (int j = 0; j < 128; ++j) {
                 const int64_t k = g * 128 + j;
                 const double w = w_row[(size_t)k];
                 ref_fp += w * (double)__half2float(x_h[(size_t)k]);
                 // int levels: Q2 codes-1 in {-1..2}; Q1 2*bit-1 in {-1,1}
-                const double d_scale = __half2float(
-                    (std::is_same_v<Block, BlockQ2_0>)
-                        ? reinterpret_cast<const BlockQ2_0*>(blocks)[r * groups + g].d
-                        : reinterpret_cast<const BlockQ1_0*>(blocks)[r * groups + g].d);
-                if (j == 0) wd = d_scale;
-                const int level = (int)std::lround(d_scale == 0 ? 0 : w / d_scale);
+                const int level = (int)std::lround(wd == 0 ? 0 : w / wd);
                 dot += (long long)level * a8[(size_t)k];
             }
             ref_int8 += wd * (double)ascale[(size_t)g] * (double)dot;
