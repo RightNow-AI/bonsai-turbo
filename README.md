@@ -6,22 +6,22 @@ collapsing the per-token pass into far fewer, fatter kernels.
 
 ## Measured results (H100 80GB SXM, cloud instance, tg128-comparable)
 
-| engine | ternary tok/s | notes |
-|---|---|---|
-| vendor fork (same machine class) | 85.5 ± 6.9 | llama-bench tg128, pinned SHA; a second host measured 94.6 |
-| vendor published | 98.0 | their model card |
-| **bonsai-turbo, eager** | **112.6** | 128 greedy tokens |
-| **bonsai-turbo, CUDA graph** | **135.8** | one graph launch per token |
+| engine | ternary tok/s | 1-bit tok/s | notes |
+|---|---|---|---|
+| vendor fork (same machine class) | 85.5 ± 6.9 | 90.1 ± 3.5 | llama-bench tg128, pinned SHA; a second host measured 94.6 ternary |
+| vendor published | 98.0 | 104.8 | their model cards |
+| **bonsai-turbo (CUDA graph)** | **140.1** | **122.5** | 128 greedy tokens, one graph launch per token; eager mode: 112-118 |
 
-Speedup: **1.59x** vs the vendor fork measured on identical hardware, **1.39x** vs
-their published H100 number. Work in progress toward the 350+ target — every number
+Speedup, ternary: **1.64x** vs the vendor fork measured on identical hardware,
+**1.43x** vs their published H100 number. 1-bit: 1.36x / 1.17x (its GEMV inner
+loop is not yet tuned). Work in progress toward the 350+ target — every number
 above is measured, none are projected.
 
-**Correctness first:** logit parity passes on 32/32 fixed prompts (greedy top-1
-identical at every step, or ties where the vendor's own top-1/top-2 margin was
-<= 0.034; pre-divergence top-20 logit deltas stay within the measured cross-engine
-int8-activation noise floor of ~1.2). See `scripts/parity.sh`. MATH-500 gate: in
-progress.
+**Correctness first:** logit parity passes on 32/32 fixed prompts against the
+vendor fork on the exact shipping build (greedy top-1 identical at every step,
+or ties where the vendor's own top-1/top-2 margin was <= 0.034; pre-divergence
+top-20 logit deltas stay within the measured cross-engine int8-activation noise
+floor of ~1.2). See `scripts/parity.sh`. MATH-500 gate: in progress.
 
 ## Where the speed comes from (measured, not guessed)
 
