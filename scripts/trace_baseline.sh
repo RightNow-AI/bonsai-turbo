@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Capture nsys traces of the vendor fork decoding, and derive per-token launch
-# counts and GPU idle fraction. Method: run the identical prompt twice with
-# -n 8 and -n 72 generated tokens; every count is differenced between the two
-# runs, so prompt processing, warmup, and load noise cancel and what remains is
-# the steady-state per-token decode cost over 64 tokens.
-# Works on any Linux box with an NVIDIA GPU + nsight-systems; no cloud dependency.
+# Per-token decode profile of the vendor fork: kernel executions per token and
+# GPU busy fraction, via an in-process CUPTI shim (no profiler daemon — works
+# in unprivileged containers where nsys stalls).
 #
-# Env overrides: FORK_DIR, WEIGHTS_DIR, OUT_DIR, TRACE_MODEL
+# Method: run the identical prompt with -n 8 and -n 40 generated tokens; every
+# counter is differenced between runs, so load/warmup/prompt costs cancel and
+# what remains is steady-state per-token decode cost.
+# Works on any Linux box with an NVIDIA GPU + CUDA toolkit; no cloud dependency.
+#
+# Env overrides: FORK_DIR, WEIGHTS_DIR, OUT_DIR, TRACE_MODEL, TRACE_N_HI
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,12 +20,14 @@ MODEL="${TRACE_MODEL:-$WEIGHTS_DIR/Ternary-Bonsai-27B-Q2_0.gguf}"
 PROMPT="The roofline model of GPU performance says"
 mkdir -p "$OUT_DIR"
 
-if ! command -v nsys >/dev/null 2>&1; then
-    echo "!! nsys not found; install nsight-systems to capture traces" >&2
-    exit 1
-fi
+CUPTI_INC="${CUPTI_INC:-/usr/local/cuda/extras/CUPTI/include}"
+CUPTI_LIB="${CUPTI_LIB:-/usr/local/cuda/extras/CUPTI/lib64}"
+SHIM="$OUT_DIR/cupti_shim.so"
+echo "== building CUPTI shim"
+gcc -shared -fPIC "$ROOT/tools/cupti_shim.c" -I"$CUPTI_INC" -L"$CUPTI_LIB" \
+    -lcupti -Wl,-rpath,"$CUPTI_LIB" -o "$SHIM"
 
-# network/FUSE-mounted weights are slow under the profiler; stage locally
+# network/FUSE-mounted weights are slow to load repeatedly; stage locally
 if [ "${TRACE_STAGE_LOCAL:-0}" = "1" ]; then
     echo "== staging model to local disk"
     cp -f "$MODEL" /tmp/trace-model.gguf
@@ -33,15 +37,11 @@ fi
 N_LO=8
 N_HI="${TRACE_N_HI:-40}"
 for N in "$N_LO" "$N_HI"; do
-    echo "== nsys profile: n=$N decode tokens"
-    # --sample/--cpuctxsw off: CPU sampling needs perf_event privileges that
-    # containers usually lack and nsys stalls waiting for them
-    timeout 900 nsys profile --trace=cuda --sample=none --cpuctxsw=none \
-        --force-overwrite true -o "$OUT_DIR/trace_n$N" \
-        "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" -ngl 99 -no-cnv --temp 0 --seed 1 \
+    echo "== profiled run: n=$N decode tokens"
+    CUPTI_SHIM_OUT="$OUT_DIR/shim_n$N.json" LD_PRELOAD="$SHIM" \
+        timeout 900 "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" -ngl 99 -no-cnv \
+        --temp 0 --seed 1 \
         > "$OUT_DIR/cli_n$N.stdout" 2> "$OUT_DIR/cli_n$N.stderr"
-    timeout 600 nsys stats --report cuda_api_sum --report cuda_gpu_kern_sum --format csv \
-        --output "$OUT_DIR/trace_n$N" --force-export true "$OUT_DIR/trace_n$N.nsys-rep" >/dev/null
 done
 
 python3 "$ROOT/scripts/analyze_trace.py" "$OUT_DIR" "$N_LO" "$N_HI" | tee "$OUT_DIR/trace_summary.json"
