@@ -26,18 +26,49 @@ VENDOR_TERNARY_SCORE = 99.20
 
 
 def read_gguf_strings(model: str):
-    from gguf import GGUFReader
+    """Minimal GGUF v3 metadata reader (the pip `gguf` package rejects the
+    vendor's custom tensor types; we never touch the tensor table anyway)."""
+    import struct
 
-    r = GGUFReader(model)
+    f = open(model, "rb")
 
-    def field_str(name):
-        f = r.get_field(name)
-        return str(bytes(f.parts[f.data[0]]), "utf-8") if f else None
+    def u32():
+        return struct.unpack("<I", f.read(4))[0]
 
-    tokens_field = r.get_field("tokenizer.ggml.tokens")
-    tokens = [str(bytes(tokens_field.parts[i]), "utf-8", errors="replace")
-              for i in tokens_field.data]
-    return field_str("tokenizer.chat_template"), tokens
+    def u64():
+        return struct.unpack("<Q", f.read(8))[0]
+
+    def s():
+        return f.read(u64()).decode("utf-8", errors="replace")
+
+    SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+    def value(t):
+        if t == 8:
+            return s()
+        if t == 9:
+            et, n = u32(), u64()
+            return [value(et) for _ in range(n)]
+        f.read(SCALAR[t])  # scalar payloads are irrelevant here
+        return None
+
+    assert f.read(4) == b"GGUF" and u32() == 3
+    u64()  # n_tensors
+    n_kv = u64()
+    template, tokens = None, None
+    for _ in range(n_kv):
+        key = s()
+        t = u32()
+        if key == "tokenizer.chat_template" and t == 8:
+            template = s()
+        elif key == "tokenizer.ggml.tokens" and t == 9:
+            tokens = value(9)
+        else:
+            value(t)
+        if template is not None and tokens is not None:
+            break
+    f.close()
+    return template, tokens
 
 
 def bytes_to_unicode():

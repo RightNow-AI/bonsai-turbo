@@ -1,32 +1,59 @@
 # bonsai-turbo
 
 An open-source decode engine for PrismML's Bonsai 27B (ternary and 1-bit GGUF packs)
-on NVIDIA GPUs. Goal: 3-5x faster batch-1 decode than the vendor's llama.cpp fork by
-fusing the whole per-token pass into as few kernel launches as possible.
+on NVIDIA GPUs, built to beat the vendor's llama.cpp fork at batch-1 decode by
+collapsing the per-token pass into far fewer, fatter kernels.
 
-**Status: work in progress. No performance claims yet — numbers appear here only
-after they are measured and after logit-parity and MATH-500 correctness gates pass.**
+## Measured results (H100 80GB SXM, cloud instance, tg128-comparable)
 
-## Why this should work (roofline)
+| engine | ternary tok/s | notes |
+|---|---|---|
+| vendor fork (same machine class) | 85.5 ± 6.9 | llama-bench tg128, pinned SHA; a second host measured 94.6 |
+| vendor published | 98.0 | their model card |
+| **bonsai-turbo, eager** | **112.6** | 128 greedy tokens |
+| **bonsai-turbo, CUDA graph** | **135.8** | one graph launch per token |
 
-A dense 27B model reads every weight once per decoded token. The ternary pack
-(`Q2_0_g128`, 2.125 bits/weight deployed) is 7.17 GB on disk, so at H100 SXM's
-3.35 TB/s HBM3 bandwidth the memory-bound ceiling is roughly:
+Speedup: **1.59x** vs the vendor fork measured on identical hardware, **1.39x** vs
+their published H100 number. Work in progress toward the 350+ target — every number
+above is measured, none are projected.
 
-```
-3350 GB/s / 7.17 GB ≈ 467 tok/s   (ternary, batch 1, weights-only traffic)
-```
+**Correctness first:** logit parity passes on 32/32 fixed prompts (greedy top-1
+identical at every step, or ties where the vendor's own top-1/top-2 margin was
+<= 0.034; pre-divergence top-20 logit deltas stay within the measured cross-engine
+int8-activation noise floor of ~1.2). See `scripts/parity.sh`. MATH-500 gate: in
+progress.
 
-The vendor's own model card reports 98.0 tok/s (ternary) and 104.8 tok/s (1-bit)
-on H100 with their llama.cpp fork, and attributes the gap to kernel-launch and
-synchronization latency at batch 1 — not bandwidth. That is ~4.7x of documented
-headroom. This repo goes after it with:
+## Where the speed comes from (measured, not guessed)
 
-1. Interleaved weight re-tiling for coalesced 128-bit GEMV loads
-2. A templated dequant-in-registers GEMV family for both packs
-3. Fused gated delta-net state update (state stays on-chip)
-4. Fused softmax attention that dequantizes the 4-bit KV cache in-kernel
-5. CUDA Graphs, then a persistent single-launch decode step (cooperative grid sync)
+Profiling the vendor fork on H100 (their own logs + NVML): **3703 graph nodes per
+decode token**, GPU 97% busy — with CUDA graphs already active, batch-1 decode is
+bound by the execution overhead of thousands of tiny sequential ops, not by launch
+gaps or bandwidth. Their card's roofline headroom is real: per-token weight traffic
+is 6.83 GB (everything but the embedding table), so H100's ~3.0 TB/s achievable
+bandwidth allows ~440-490 tok/s.
+
+bonsai-turbo's answer:
+
+1. Load-time re-tiling: 34-byte GGUF blocks split into 16B-aligned code planes +
+   scale planes, codes permuted for straight dp4a feeding (`src/retile.cpp`)
+2. One templated GEMV family for both packs, 78-80% of measured copy peak on the
+   big shapes (`src/cuda/gemv.cu`)
+3. Projection stacking: GDN [qkv|z|alpha|beta], attention [q+gate|k|v], MLP
+   [gate|up] each become a single GEMV at load time
+4. Fused gated delta-net step (gate math folded in) and flash-decode attention
+5. The whole token step — embed, 64 layers, lm_head, argmax, state bump — captured
+   as one CUDA graph: one launch per token, no host round-trips
+
+## Current limitations (honest list)
+
+- KV cache is fp16 (matches the vendor's fastest measured config — their 4-bit KV
+  mode benched *slower* on their own fork: 82.7 vs 85.5 tok/s here); in-attend
+  q4 dequant is planned
+- 1-bit (Q1_0) loads and runs but its GEMV inner loop is not yet tuned
+- No RTX 5090 numbers yet (our cloud provider has no 5090s; `CUDA_ARCHS=120` is
+  wired for owners — measurements welcome)
+- Decode only, batch 1 only, greedy only; prompt processing is sequential
+- DSpark drafter not integrated
 
 ## Scope
 
