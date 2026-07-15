@@ -278,9 +278,10 @@ void gemv_launch(int nbits, const uint8_t* codes, const __half* w_scale,
                  float* y, int M, int K, cudaStream_t stream) {
     const int row_blocks = (M + 31) / 32;
     // fill the GPU: aim for ~1024 blocks, but keep >=32 chunks per split so
-    // every lane of the chunk-striding warps has work
+    // every lane of the chunk-striding warps has work; matrices with plenty of
+    // row blocks skip splitting entirely (memset+atomic overhead beats it)
     const int chunks = (nbits == 2 ? K / 4 : K / 8) / 16;
-    int splits = 1024 / row_blocks;
+    int splits = row_blocks >= 256 ? 1 : 1024 / row_blocks;
     splits = max(1, min(splits, chunks / 32));
     const int cps = ((chunks + splits - 1) / splits + 1) & ~1;
     const int a_slice = cps * (nbits == 2 ? 64 : 128);

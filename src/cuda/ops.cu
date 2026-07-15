@@ -167,6 +167,79 @@ __global__ void embed_lookup_kernel(const __half* __restrict__ table, int token,
     if (i < n) out[i] = table[(size_t)token * n + i];
 }
 
+// stage 1: each block writes its partial (max, idx) pair
+__global__ void argmax_partial_kernel(const float* __restrict__ x, int n,
+                                      float* __restrict__ pv, int32_t* __restrict__ pi) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    float best = -INFINITY;
+    int besti = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        if (x[i] > best || (x[i] == best && i < besti)) {
+            best = x[i];
+            besti = i;
+        }
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, best, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFu, besti, off);
+        if (ov > best || (ov == best && oi < besti)) {
+            best = ov;
+            besti = oi;
+        }
+    }
+    if (lane == 0) {
+        bv[warp] = best;
+        bi[warp] = besti;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int n_warps = (blockDim.x + 31) >> 5;
+        best = lane < n_warps ? bv[lane] : -INFINITY;
+        besti = lane < n_warps ? bi[lane] : 0;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, besti, off);
+            if (ov > best || (ov == best && oi < besti)) {
+                best = ov;
+                besti = oi;
+            }
+        }
+        if (lane == 0) {
+            pv[blockIdx.x] = best;
+            pi[blockIdx.x] = besti;
+        }
+    }
+}
+
+// stage 2: one warp reduces the partials
+__global__ void argmax_final_kernel(const float* __restrict__ pv,
+                                    const int32_t* __restrict__ pi, int n_parts,
+                                    int32_t* __restrict__ out) {
+    float best = -INFINITY;
+    int besti = 0;
+    for (int i = threadIdx.x; i < n_parts; i += 32) {
+        if (pv[i] > best || (pv[i] == best && pi[i] < besti)) {
+            best = pv[i];
+            besti = pi[i];
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, best, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFu, besti, off);
+        if (ov > best || (ov == best && oi < besti)) {
+            best = ov;
+            besti = oi;
+        }
+    }
+    if (threadIdx.x == 0) *out = besti;
+}
+
 __global__ void argmax_kernel(const float* __restrict__ x, int n, int32_t* __restrict__ out) {
     __shared__ float best_v[32];
     __shared__ int best_i[32];
@@ -309,7 +382,19 @@ void embed_lookup_launch(const __half* table, int token, int n, __half* out,
 }
 
 void argmax_launch(const float* x, int n, int32_t* out, cudaStream_t stream) {
-    argmax_kernel<<<1, 1024, 0, stream>>>(x, n, out);
+    if (n <= 16384) {
+        argmax_kernel<<<1, 1024, 0, stream>>>(x, n, out);
+        return;
+    }
+    constexpr int kParts = 132;
+    static float* pv = nullptr;
+    static int32_t* pi = nullptr;
+    if (!pv) {
+        cudaMalloc(&pv, kParts * 4);
+        cudaMalloc(&pi, kParts * 4);
+    }
+    argmax_partial_kernel<<<kParts, 256, 0, stream>>>(x, n, pv, pi);
+    argmax_final_kernel<<<1, 32, 0, stream>>>(pv, pi, kParts, out);
 }
 
 void conv1d_step_launch(const __half* x, const __half* w, float* conv_state,
