@@ -25,6 +25,7 @@
 #include "../src/cuda/attn.h"
 #include "../src/cuda/gdn.h"
 #include "../src/cuda/gemv.h"
+#include "../src/cuda/mega.h"
 #include "../src/cuda/ops.h"
 #include "../src/model.h"
 
@@ -49,6 +50,7 @@ struct Runtime {
     int max_ctx = 8192;
     int eos = -1;
     bool graph_mode = false;
+    bool mega_mode = false;
     cudaStream_t st = nullptr;
 
     // activation buffers (f16 unless noted)
@@ -60,8 +62,14 @@ struct Runtime {
     int32_t* a_gsum;
     int quant_k = 0;
 
-    // device-resident control state (graph mode)
+    // device-resident control state (graph/mega modes)
     int32_t *d_pos, *d_step, *d_tok, *d_ring;
+    // megakernel plumbing
+    float* red_scratch = nullptr;
+    float* amax_v = nullptr;
+    int32_t* amax_i = nullptr;
+    MegaLayer* d_mlayers = nullptr;
+    MegaParams mp{};
 
     // per-layer persistent state
     std::vector<float*> gdn_state;
@@ -101,6 +109,9 @@ struct Runtime {
         CUDA_CHECK(cudaMalloc(&d_step, 4));
         CUDA_CHECK(cudaMalloc(&d_tok, 4));
         CUDA_CHECK(cudaMalloc(&d_ring, kRingCap * 4));
+        CUDA_CHECK(cudaMalloc(&red_scratch, (size_t)(2 * hp.n_layer + 4) * 4));
+        CUDA_CHECK(cudaMalloc(&amax_v, 4096 * 4));
+        CUDA_CHECK(cudaMalloc(&amax_i, 4096 * 4));
 
         for (int il = 0; il < hp.n_layer; ++il) {
             if (m.layers[(size_t)il].recurrent) {
@@ -126,6 +137,89 @@ struct Runtime {
             }
         }
         reset_sequence();
+        build_mega();
+    }
+
+    static MegaMat as_mega(const Mat& m) {
+        return MegaMat{m.codes, m.scales, m.M, m.K, m.nbits};
+    }
+
+    void build_mega() {
+        const HParams& hp = m.hp;
+        std::vector<MegaLayer> host((size_t)hp.n_layer);
+        for (int il = 0; il < hp.n_layer; ++il) {
+            const Layer& l = m.layers[(size_t)il];
+            MegaLayer& d = host[(size_t)il];
+            d.recurrent = l.recurrent ? 1 : 0;
+            d.attn_norm = l.attn_norm;
+            d.post_norm = l.attn_post_norm;
+            d.gate_up = as_mega(l.gate_up);
+            d.down = as_mega(l.down);
+            d.mlp_gate_rows = l.gate_rows;
+            if (l.recurrent) {
+                d.proj = as_mega(l.gdn_fused);
+                d.out_proj = as_mega(l.ssm_out);
+                d.in_rows = l.ssm_in_rows;
+                d.gate_rows = l.ssm_gate_rows;
+                d.ssm_norm = l.ssm_norm;
+                d.ssm_a = l.ssm_a;
+                d.ssm_dt = l.ssm_dt;
+                d.conv_w = l.conv_w;
+                d.gdn_state = gdn_state[(size_t)il];
+                d.conv_state = conv_state[(size_t)il];
+            } else {
+                d.proj = as_mega(l.qkv_fused);
+                d.out_proj = as_mega(l.wo);
+                d.in_rows = l.wq_rows;
+                d.gate_rows = 0;
+                d.q_norm = l.q_norm;
+                d.k_norm = l.k_norm;
+                d.k_cache = k_cache[(size_t)il];
+                d.v_cache = v_cache[(size_t)il];
+            }
+        }
+        CUDA_CHECK(cudaMalloc(&d_mlayers, host.size() * sizeof(MegaLayer)));
+        CUDA_CHECK(cudaMemcpy(d_mlayers, host.data(), host.size() * sizeof(MegaLayer),
+                              cudaMemcpyHostToDevice));
+
+        mp.layers = d_mlayers;
+        mp.tok_embd = as_mega(m.tok_embd);
+        mp.lm_head = as_mega(m.lm_head);
+        mp.output_norm = m.output_norm;
+        mp.n_layer = hp.n_layer;
+        mp.n_embd = hp.n_embd;
+        mp.n_ff = hp.n_ff;
+        mp.vocab = hp.vocab;
+        mp.n_head = hp.n_head;
+        mp.n_head_kv = hp.n_head_kv;
+        mp.head_dim = hp.head_dim;
+        mp.n_rot = hp.n_rot;
+        mp.ssm_state = hp.ssm_state;
+        mp.ssm_groups = hp.ssm_groups;
+        mp.ssm_dt_rank = hp.ssm_dt_rank;
+        mp.head_v_dim = hp.head_v_dim;
+        mp.ssm_conv = hp.ssm_conv;
+        mp.conv_channels = hp.conv_channels;
+        mp.rms_eps = hp.rms_eps;
+        mp.rope_base = hp.rope_base;
+        mp.x = x;
+        mp.xn = xn;
+        mp.big_a = big_a;
+        mp.big_b = big_b;
+        mp.q_buf = q;
+        mp.attn_out = attn_out;
+        mp.y32 = y32;
+        mp.a8 = a8;
+        mp.a_scale = a_scale;
+        mp.a_gsum = a_gsum;
+        mp.red_scratch = red_scratch;
+        mp.amax_v = amax_v;
+        mp.amax_i = amax_i;
+        mp.d_pos = d_pos;
+        mp.d_step = d_step;
+        mp.d_tok = d_tok;
+        mp.d_ring = d_ring;
+        mp.ring_cap = kRingCap;
     }
 
     void reset_sequence() {
@@ -389,11 +483,23 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
     FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
     std::vector<float> logits((size_t)hp.vocab);
 
-    // prompt phase always eager (graph capture only covers steady-state decode)
-    const bool want_graph = rt.graph_mode;
-    rt.graph_mode = false;
-    for (int id : prompt) decode_eager(rt, id);
-    rt.graph_mode = want_graph;
+    // prompt phase: mega mode feeds the megakernel token by token; otherwise
+    // eager (graph capture only covers steady-state decode)
+    if (rt.mega_mode) {
+        for (int id : prompt) {
+            CUDA_CHECK(cudaMemcpyAsync(rt.d_tok, &id, 4, cudaMemcpyHostToDevice, rt.st));
+            if (!mega_decode_launch(rt.mp, rt.st)) std::exit(1);
+        }
+        // bump advanced d_step during the prompt; generation records from 0
+        CUDA_CHECK(cudaStreamSynchronize(rt.st));
+        CUDA_CHECK(cudaMemset(rt.d_step, 0, 4));
+        rt.pos = (int)prompt.size();
+    } else {
+        const bool want_graph = rt.graph_mode;
+        rt.graph_mode = false;
+        for (int id : prompt) decode_eager(rt, id);
+        rt.graph_mode = want_graph;
+    }
 
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
@@ -402,7 +508,38 @@ void run_prompt(Runtime& rt, const std::vector<int>& prompt, int n_gen,
     std::printf("generated:");
     int n_done = 0;
 
-    if (!rt.graph_mode) {
+    if (rt.mega_mode) {
+        int32_t first = 0;
+        CUDA_CHECK(cudaMemcpy(&first, rt.d_tok, 4, cudaMemcpyDeviceToHost));
+        std::printf(" %d", first);
+        n_done = 1;
+
+        CUDA_CHECK(cudaEventRecord(t0, rt.st));
+        std::vector<int32_t> ring(kRingCap);
+        int launched = 0;
+        bool done = first == rt.eos;
+        while (n_done < n_gen && !done) {
+            const int todo = std::min(16, n_gen - n_done);
+            for (int i = 0; i < todo; ++i) {
+                if (!mega_decode_launch(rt.mp, rt.st)) std::exit(1);
+                ++launched;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(rt.st));
+            CUDA_CHECK(cudaMemcpy(ring.data(), rt.d_ring, (size_t)launched * 4,
+                                  cudaMemcpyDeviceToHost));
+            while (n_done - 1 < launched && n_done < n_gen) {
+                const int32_t tok = ring[(size_t)(n_done - 1)];
+                std::printf(" %d", tok);
+                ++n_done;
+                if (tok == rt.eos) {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(t1, rt.st));
+        rt.pos += launched;
+    } else if (!rt.graph_mode) {
         CUDA_CHECK(cudaEventRecord(t0, rt.st));
         int32_t tok = 0;
         for (int i = 0; i < n_gen; ++i) {
@@ -493,7 +630,7 @@ int main(int argc, char** argv) {
     int n_gen = 32;
     int eos = -1;
     int ctx = 8192;
-    bool bench = false, graph = false;
+    bool bench = false, graph = false, mega = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) model_path = argv[++i];
@@ -503,6 +640,7 @@ int main(int argc, char** argv) {
         else if (a == "--logits-out" && i + 1 < argc) logits_out = argv[++i];
         else if (a == "--bench") bench = true;
         else if (a == "--graph") graph = true;
+        else if (a == "--mega") mega = true;
         else if (a == "--eos" && i + 1 < argc) eos = std::atoi(argv[++i]);
         else if (a == "--ctx" && i + 1 < argc) ctx = std::atoi(argv[++i]);
     }
@@ -529,6 +667,7 @@ int main(int argc, char** argv) {
     rt.alloc();
     rt.eos = eos;
     rt.graph_mode = graph;
+    rt.mega_mode = mega;
 
     if (graph && !logits_out.empty()) {
         std::fprintf(stderr, "--graph and --logits-out are mutually exclusive\n");

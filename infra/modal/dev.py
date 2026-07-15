@@ -121,12 +121,12 @@ def speed(n_gen: int = 128, model: str = "ternary") -> str:
     _sh(["cmake", "--build", "/tmp/build", "-j"])
     # tg128-comparable: short fixed prompt, time n_gen greedy decode steps
     ids = "785,9426,1614,315,22670,5068,2727,429"
-    out = ["== eager =="]
-    out.append(_sh(["/tmp/build/bt-run", "--model", MODELS[model],
-                    "--ids", ids, "--n", str(n_gen), "--bench"]))
-    out.append("== cuda graph ==")
+    out = ["== cuda graph =="]
     out.append(_sh(["/tmp/build/bt-run", "--model", MODELS[model],
                     "--ids", ids, "--n", str(n_gen), "--bench", "--graph"]))
+    out.append("== megakernel ==")
+    out.append(_sh(["/tmp/build/bt-run", "--model", MODELS[model],
+                    "--ids", ids, "--n", str(n_gen), "--bench", "--mega"]))
     return "\n".join(out)
 
 
