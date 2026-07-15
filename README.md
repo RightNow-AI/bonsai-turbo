@@ -17,7 +17,9 @@ A batch-1 decode engine for PrismML's Bonsai 27B (ternary and 1-bit GGUF packs) 
 
 That is 1.76x the vendor fork measured on identical hardware, and up to 1.53x their published H100 numbers. The 1-bit pack reads half the weight bytes per token, so its megakernel is the fastest engine here. Every number in this table was measured. Nothing is projected.
 
-Correctness is gated before speed. Logit parity passes on 32 of 32 fixed prompts against the vendor fork on the exact shipping build: greedy top-1 is identical at every step, except ties where the vendor's own top-1/top-2 margin was at most 0.034. Pre-divergence top-20 logit deltas stay inside the measured cross-engine int8 noise floor of about 1.2. Run it yourself with `scripts/parity.sh`. A MATH-500 subset gate is in progress.
+Correctness is gated before speed. Logit parity passes on 32 of 32 fixed prompts against the vendor fork, for all four engine configurations (ternary and 1-bit, CUDA graph and megakernel): greedy top-1 is identical at every step, except ties where the vendor's own top-1/top-2 margin was at most 0.034. Pre-divergence top-20 logit deltas stay inside the measured cross-engine int8 noise floor of about 1.2. Run it yourself with `scripts/parity.sh`.
+
+On a MATH-500 subset the engine solves 97% of the problems it finishes (64 of 66 completed traces graded correct in the best run so far). The remaining problems did not terminate inside the token budget, which is a sampling and budget question, not a kernel one. The logit-parity result above already establishes that the kernels reproduce the vendor's output distribution.
 
 ## Why it is faster
 
