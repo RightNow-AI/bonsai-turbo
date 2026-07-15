@@ -151,13 +151,16 @@ def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2")
 
     vend = subprocess.run(
         ["/data/fork/build/bin/llama-eval-callback", "-m", MODELS[model], "-p", prompt,
-         "-n", "1", "-ngl", "99"], env=env, capture_output=True, text=True)
+         "-n", "1", "-ngl", "99", "-v"], env=env, capture_output=True, text=True)
     text = vend.stdout + vend.stderr
     keep = [l for l in text.splitlines()
-            if re.search(r"-0 |l_out-0|attn_residual-0|post_ffn-0", l)
-            and ("sum" in l or "ggml_debug" in l)]
-    print("=== VENDOR (layer 0) ===")
-    print("\n".join(keep[:220]))
+            if re.search(r"(attn_norm|qkv_mixed|^z|z-0|conv_output|final_output|"
+                         r"linear_attn_out|attn_residual|post_ffn|beta|a_softplus"
+                         r"|gate)-0", l)]
+    print("=== VENDOR (layer 0 matches) ===")
+    print("\n".join(keep[:250]))
+    print("=== VENDOR raw tail ===")
+    print(text[-3000:])
     return "done"
 
 
