@@ -9,11 +9,13 @@ regenerate them with `scripts/repro.sh` on your own machine.
 | engine | ternary tok/s | 1-bit tok/s |
 |---|---|---|
 | vendor llama.cpp fork @ 62061f91, llama-bench tg128, 3 reps | 85.5 +/- 6.9 | 90.1 +/- 3.5 |
-| bonsai-turbo, CUDA graph mode | 151.1 | 122.5 |
-| bonsai-turbo, megakernel | 149.6 | not tuned |
+| bonsai-turbo, CUDA graph mode | 151.1 | 133.0 |
+| bonsai-turbo, megakernel | 149.6 | 158.7 |
 
 Run-to-run spread for bonsai-turbo across containers was 146.8 to 151.4
-(ternary, graph mode). A second vendor-fork host measured 94.6 ternary.
+(ternary, graph mode). A second vendor-fork host measured 94.6 ternary. The
+1-bit megakernel (158.7) is the fastest engine measured; the 1-bit pack reads
+half the weight bytes per token. Both 1-bit engines pass 32/32 logit parity.
 
 ## Correctness
 

@@ -12,10 +12,10 @@ A batch-1 decode engine for PrismML's Bonsai 27B (ternary and 1-bit GGUF packs) 
 |---|---|---|
 | vendor llama.cpp fork, measured on the same machine class | 85.5 +/- 6.9 | 90.1 +/- 3.5 |
 | vendor published numbers | 98.0 | 104.8 |
-| bonsai-turbo, CUDA graph mode | **151.1** | 122.5 |
-| bonsai-turbo, megakernel (`--mega`) | 149.6 | not tuned yet |
+| bonsai-turbo, CUDA graph mode | 151.1 | 133.0 |
+| bonsai-turbo, megakernel (`--mega`) | 149.6 | **158.7** |
 
-That is 1.76x the vendor fork measured on identical hardware, and 1.53x their published H100 number. Every number in this table was measured. Nothing is projected.
+That is 1.76x the vendor fork measured on identical hardware, and up to 1.53x their published H100 numbers. The 1-bit pack reads half the weight bytes per token, so its megakernel is the fastest engine here. Every number in this table was measured. Nothing is projected.
 
 Correctness is gated before speed. Logit parity passes on 32 of 32 fixed prompts against the vendor fork on the exact shipping build: greedy top-1 is identical at every step, except ties where the vendor's own top-1/top-2 margin was at most 0.034. Pre-divergence top-20 logit deltas stay inside the measured cross-engine int8 noise floor of about 1.2. Run it yourself with `scripts/parity.sh`. A MATH-500 subset gate is in progress.
 
@@ -76,7 +76,7 @@ docs/assets/    the header diagram (LaTeX source + build script)
 ## Current limitations
 
 - The KV cache is fp16. This matches the vendor's fastest measured config: their 4-bit KV mode benched slower on their own fork (82.7 vs 85.5 tok/s here). In-attention q4 dequant is planned.
-- The 1-bit pack loads and runs but its GEMV inner loop is not tuned.
+- The 1-bit GEMV runs in graph and megakernel modes. Its roofline ceiling is about twice the ternary one, so there is more speed to recover with a wider unpack.
 - No RTX 5090 numbers yet. Our cloud provider has no 5090s. `CUDA_ARCHS=120` is wired; measurements welcome.
 - Decode only, batch 1 only. Prompt processing is sequential. Greedy and top-k/top-p sampling.
 - The DSpark speculative drafter is not integrated yet.
