@@ -168,6 +168,7 @@ def debug_probe(prompt: str = "Hello", model: str = "ternary", level: str = "2")
 def math500(n: int = 100, max_gen: int = 3072, model: str = "ternary") -> str:
     import os
 
+    os.environ["LD_LIBRARY_PATH"] = "/data/fork/build/bin"
     _sh(["cmake", "-S", "/repo", "-B", "/tmp/build", "-G", "Ninja"])
     _sh(["cmake", "--build", "/tmp/build", "-j"])
     env = {**os.environ, "LD_LIBRARY_PATH": "/data/fork/build/bin"}
