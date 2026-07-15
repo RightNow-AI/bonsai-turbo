@@ -149,7 +149,7 @@ __device__ void stage_vals(const MegaParams& p, const MegaLayer* l, float inv_no
 // EPI 2: accumulate into dst32 (fp32 residual); when norm_slot >= 0 the
 //        epilogue also accumulates sum(x_new^2) into red_scratch[norm_slot],
 //        replacing the next norm's partial-reduction phase entirely.
-template <int EPI, int SRC>
+template <int EPI, int SRC, int NBITS>
 __device__ void op_gemv(const MegaParams& p, const MegaLayer* l, const MegaMat& m,
                         float* dst32, __half* dst16, int norm_slot,
                         float inv_norm, const __half* norm_w, uint8_t* smem,
@@ -179,7 +179,9 @@ __device__ void op_gemv(const MegaParams& p, const MegaLayer* l, const MegaMat& 
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
-    const int chunks = (K / 4) / 16;
+    // one 16-byte code chunk covers 64 codes (Q2) or 128 codes (Q1)
+    const int code_row_bytes = NBITS == 2 ? (K >> 2) : (K >> 3);
+    const int chunks = code_row_bytes / 16;
     const int tiles = (m.M + 31) / 32;
     float block_ss = 0.f;  // fused norm partial (EPI 2 with norm_slot >= 0)
 
@@ -192,30 +194,58 @@ __device__ void op_gemv(const MegaParams& p, const MegaLayer* l, const MegaMat& 
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
             const int row = min(row0 + (r < nrows ? r : 0), m.M - 1);
-            rc[r] = reinterpret_cast<const uint4*>(m.codes + (size_t)row * (K >> 2));
+            rc[r] = reinterpret_cast<const uint4*>(m.codes + (size_t)row * code_row_bytes);
             rs[r] = m.scales + (size_t)row * (K >> 7);
         }
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
         for (int c = lane; c < chunks; c += 32) {
-            const uint4* aw = reinterpret_cast<const uint4*>(s_a8 + c * 64);
-            const uint4 av[4] = {aw[0], aw[1], aw[2], aw[3]};
-            const int g = c >> 1;
-            const float as = s_scale[g];
-            const int gs = s_gsum[c];
+            if (NBITS == 2) {
+                const uint4* aw = reinterpret_cast<const uint4*>(s_a8 + c * 64);
+                const uint4 av[4] = {aw[0], aw[1], aw[2], aw[3]};
+                const int g = c >> 1;
+                const float as = s_scale[g];
+                const int gs = s_gsum[c];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                const uint4 cw = rc[r][c];
-                const uint32_t cws[4] = {cw.x, cw.y, cw.z, cw.w};
-                int dot = 0;
+                for (int r = 0; r < 4; ++r) {
+                    const uint4 cw = rc[r][c];
+                    const uint32_t cws[4] = {cw.x, cw.y, cw.z, cw.w};
+                    int dot = 0;
 #pragma unroll
-                for (int wnum = 0; wnum < 4; ++wnum) {
-                    const uint32_t wv = cws[wnum];
-                    dot = dp4a_u8s8(wv & 0x03030303u, av[wnum].x, dot);
-                    dot = dp4a_u8s8((wv >> 2) & 0x03030303u, av[wnum].y, dot);
-                    dot = dp4a_u8s8((wv >> 4) & 0x03030303u, av[wnum].z, dot);
-                    dot = dp4a_u8s8((wv >> 6) & 0x03030303u, av[wnum].w, dot);
+                    for (int wnum = 0; wnum < 4; ++wnum) {
+                        const uint32_t wv = cws[wnum];
+                        dot = dp4a_u8s8(wv & 0x03030303u, av[wnum].x, dot);
+                        dot = dp4a_u8s8((wv >> 2) & 0x03030303u, av[wnum].y, dot);
+                        dot = dp4a_u8s8((wv >> 4) & 0x03030303u, av[wnum].z, dot);
+                        dot = dp4a_u8s8((wv >> 6) & 0x03030303u, av[wnum].w, dot);
+                    }
+                    acc[r] += __half2float(rs[r][g]) * as * (float)(dot - gs);
                 }
-                acc[r] += __half2float(rs[r][g]) * as * (float)(dot - gs);
+            } else {
+                // Q1: chunk c covers codes [128c, 128c+128) = one full group
+                const uint4* aw = reinterpret_cast<const uint4*>(s_a8 + c * 128);
+                const uint4 av[8] = {aw[0], aw[1], aw[2], aw[3],
+                                     aw[4], aw[5], aw[6], aw[7]};
+                const float as = s_scale[c];
+                const int gs = s_gsum[2 * c] + s_gsum[2 * c + 1];
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const uint4 cw = rc[r][c];
+                    const uint32_t cws[4] = {cw.x, cw.y, cw.z, cw.w};
+                    int dot = 0;
+#pragma unroll
+                    for (int wnum = 0; wnum < 4; ++wnum) {
+                        const uint32_t wv = cws[wnum];
+                        dot = dp4a_u8s8(wv & 0x01010101u, av[wnum * 2].x, dot);
+                        dot = dp4a_u8s8((wv >> 1) & 0x01010101u, av[wnum * 2].y, dot);
+                        dot = dp4a_u8s8((wv >> 2) & 0x01010101u, av[wnum * 2].z, dot);
+                        dot = dp4a_u8s8((wv >> 3) & 0x01010101u, av[wnum * 2].w, dot);
+                        dot = dp4a_u8s8((wv >> 4) & 0x01010101u, av[wnum * 2 + 1].x, dot);
+                        dot = dp4a_u8s8((wv >> 5) & 0x01010101u, av[wnum * 2 + 1].y, dot);
+                        dot = dp4a_u8s8((wv >> 6) & 0x01010101u, av[wnum * 2 + 1].z, dot);
+                        dot = dp4a_u8s8((wv >> 7) & 0x01010101u, av[wnum * 2 + 1].w, dot);
+                    }
+                    acc[r] += __half2float(rs[r][c]) * as * (float)(2 * dot - gs);
+                }
             }
         }
 #pragma unroll
@@ -631,6 +661,7 @@ __device__ __forceinline__ void stamp(const MegaParams& p) {
     }
 }
 
+template <int NBITS>
 __global__ void __launch_bounds__(256)
 mega_decode_kernel(MegaParams p) {
     cg::grid_group grid = cg::this_grid();
@@ -654,7 +685,7 @@ mega_decode_kernel(MegaParams p) {
     for (int il = 0; il < p.n_layer; ++il) {
         const MegaLayer& l = p.layers[il];
         const float inv1 = rsqrtf(rs[base + 2 * il] / p.n_embd + p.rms_eps);
-        op_gemv<1, SRC_NORM_X>(p, &l, l.proj, nullptr, p.big_a, -1, inv1,
+        op_gemv<1, SRC_NORM_X, NBITS>(p, &l, l.proj, nullptr, p.big_a, -1, inv1,
                                l.attn_norm, smem, bid, nb);
         grid.sync();
         stamp(p);
@@ -679,12 +710,12 @@ mega_decode_kernel(MegaParams p) {
         }
         grid.sync();
         stamp(p);
-        op_gemv<2, SRC_FROM_A8>(p, &l, l.out_proj, p.x, nullptr,
+        op_gemv<2, SRC_FROM_A8, NBITS>(p, &l, l.out_proj, p.x, nullptr,
                                 base + 2 * il + 1, 0.f, nullptr, smem, bid, nb);
         grid.sync();
         stamp(p);
         const float inv2 = rsqrtf(rs[base + 2 * il + 1] / p.n_embd + p.rms_eps);
-        op_gemv<1, SRC_NORM_X>(p, &l, l.gate_up, nullptr, p.big_a, -1, inv2,
+        op_gemv<1, SRC_NORM_X, NBITS>(p, &l, l.gate_up, nullptr, p.big_a, -1, inv2,
                                l.post_norm, smem, bid, nb);
         grid.sync();
         stamp(p);
@@ -693,14 +724,14 @@ mega_decode_kernel(MegaParams p) {
         stamp(p);
         const int next_slot =
             il + 1 < p.n_layer ? base + 2 * (il + 1) : base + 2 * p.n_layer;
-        op_gemv<2, SRC_FROM_A8>(p, &l, l.down, p.x, nullptr, next_slot, 0.f,
+        op_gemv<2, SRC_FROM_A8, NBITS>(p, &l, l.down, p.x, nullptr, next_slot, 0.f,
                                 nullptr, smem, bid, nb);
         grid.sync();
         stamp(p);
     }
 
     const float inv_h = rsqrtf(rs[base + 2 * p.n_layer] / p.n_embd + p.rms_eps);
-    op_gemv<0, SRC_NORM_X>(p, nullptr, p.lm_head, p.y32, nullptr, -1, inv_h,
+    op_gemv<0, SRC_NORM_X, NBITS>(p, nullptr, p.lm_head, p.y32, nullptr, -1, inv_h,
                            p.output_norm, smem, bid, nb);
     grid.sync();
     stamp(p);
@@ -713,6 +744,9 @@ mega_decode_kernel(MegaParams p) {
 }  // namespace
 
 bool mega_decode_launch(const MegaParams& p, cudaStream_t stream) {
+    const void* kfn = p.tok_embd.nbits == 2
+                          ? (const void*)mega_decode_kernel<2>
+                          : (const void*)mega_decode_kernel<1>;
     static int grid_size = 0;
     static int smem_bytes = 0;
     if (grid_size == 0) {
@@ -727,11 +761,9 @@ bool mega_decode_launch(const MegaParams& p, cudaStream_t stream) {
         // opt into the max smem carveout so blocks/SM is bounded by threads
         // (2048/256 = 8), not the 48KB default carveout (48/19 = 2). More
         // resident blocks = more waves overlapping the latency-bound MLP GEMVs.
-        cudaFuncSetAttribute((const void*)mega_decode_kernel,
-                             cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        cudaFuncSetAttribute(kfn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
         int per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, (const void*)mega_decode_kernel, 256, smem_bytes);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kfn, 256, smem_bytes);
         if (per_sm < 1 || !prop.cooperativeLaunch) {
             std::fprintf(stderr, "mega: cooperative launch unavailable (per_sm=%d)\n",
                          per_sm);
@@ -744,8 +776,7 @@ bool mega_decode_launch(const MegaParams& p, cudaStream_t stream) {
     MegaParams p_copy = p;
     void* args[] = {&p_copy};
     const cudaError_t err = cudaLaunchCooperativeKernel(
-        (const void*)mega_decode_kernel, dim3((unsigned)grid_size), dim3(256), args,
-        (size_t)smem_bytes, stream);
+        kfn, dim3((unsigned)grid_size), dim3(256), args, (size_t)smem_bytes, stream);
     if (err != cudaSuccess) {
         std::fprintf(stderr, "mega launch: %s\n", cudaGetErrorString(err));
         return false;
