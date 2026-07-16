@@ -10,7 +10,8 @@
 \definecolor{ink}{HTML}{141414}
 \definecolor{gray1}{HTML}{5A5A5A}
 \definecolor{barv}{HTML}{C7C7C7}   % vendor: light gray
-\definecolor{acc}{HTML}{E8590C}    % ours: orange
+\definecolor{acc}{HTML}{76B900}    % ours: NVIDIA green
+\definecolor{accdark}{HTML}{4E7A00} % deeper green for text on white
 
 \begin{document}
 \begin{tikzpicture}[x=1cm, y=1cm]
@@ -25,12 +26,12 @@
   \node[anchor=west, font=\fontsize{20}{20}\selectfont\bfseries, text=gray1]
       at (\X0+#2*\S+0.3, #1+0.575) {#3};
 }
-% ours bar: orange, tok/s in white inside, speedup in orange outside
+% ours bar: green, tok/s in dark ink inside, speedup in deep green outside
 \newcommand{\obar}[4]{% y, tok/s, toklabel, speeduplabel
   \fill[acc, rounded corners=1.5pt] (\X0,#1) rectangle (\X0+#2*\S, #1+1.15);
-  \node[anchor=east, font=\fontsize{20}{20}\selectfont\bfseries, text=white]
+  \node[anchor=east, font=\fontsize{20}{20}\selectfont\bfseries, text=ink]
       at (\X0+#2*\S-0.35, #1+0.575) {#3};
-  \node[anchor=west, font=\fontsize{18}{18}\selectfont\bfseries, text=acc]
+  \node[anchor=west, font=\fontsize{18}{18}\selectfont\bfseries, text=accdark]
       at (\X0+#2*\S+0.35, #1+0.575) {#4 faster};
 }
 
