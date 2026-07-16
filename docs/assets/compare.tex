@@ -1,0 +1,65 @@
+% bonsai-turbo comparison chart for social posts. 16:9, renders to 1600x900.
+% Build: infra/modal/texbuild.py --name compare
+\documentclass[border=0pt]{standalone}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usetikzlibrary{calc}
+
+\definecolor{ink}{HTML}{141414}
+\definecolor{gray1}{HTML}{5A5A5A}
+\definecolor{barv}{HTML}{C7C7C7}   % vendor: light gray
+\definecolor{acc}{HTML}{E8590C}    % ours: orange
+
+\begin{document}
+\begin{tikzpicture}[x=1cm, y=1cm]
+\fill[white] (0,0) rectangle (32,18);
+
+% scale: tok/s -> cm.  160 tok/s over 19 cm
+\def\S{0.11875}
+\def\X0{7.3}          % bars start here
+% vendor bar: gray, number sits outside at the end
+\newcommand{\vbar}[3]{% y, tok/s, endlabel
+  \fill[barv, rounded corners=1.5pt] (\X0,#1) rectangle (\X0+#2*\S, #1+1.15);
+  \node[anchor=west, font=\fontsize{20}{20}\selectfont\bfseries, text=gray1]
+      at (\X0+#2*\S+0.3, #1+0.575) {#3};
+}
+% ours bar: orange, tok/s in white inside, speedup in orange outside
+\newcommand{\obar}[4]{% y, tok/s, toklabel, speeduplabel
+  \fill[acc, rounded corners=1.5pt] (\X0,#1) rectangle (\X0+#2*\S, #1+1.15);
+  \node[anchor=east, font=\fontsize{20}{20}\selectfont\bfseries, text=white]
+      at (\X0+#2*\S-0.35, #1+0.575) {#3};
+  \node[anchor=west, font=\fontsize{18}{18}\selectfont\bfseries, text=acc]
+      at (\X0+#2*\S+0.35, #1+0.575) {#4 faster};
+}
+
+% ---- title ----
+\node[anchor=west, font=\fontsize{27}{30}\selectfont\bfseries, text=ink] at (1.3,16.6)
+  {Bonsai 27B, decode speed on one H100};
+\node[anchor=west, font=\fontsize{15}{18}\selectfont, text=gray1] at (1.35,15.35)
+  {single request, one token at a time (batch 1), tokens per second};
+
+% ================= TERNARY group =================
+\node[anchor=west, font=\fontsize{16}{18}\selectfont\bfseries, text=ink] at (1.3,12.9) {ternary};
+\node[anchor=east, font=\fontsize{13}{15}\selectfont, text=gray1] at (\X0-0.35,12.65) {vendor fork};
+\vbar{12.05}{85.5}{85}
+\node[anchor=east, font=\fontsize{13}{15}\selectfont\bfseries, text=acc] at (\X0-0.35,11.25) {bonsai-turbo};
+\obar{10.65}{151.1}{151}{1.76x}
+
+% ================= 1-BIT group =================
+\node[anchor=west, font=\fontsize{16}{18}\selectfont\bfseries, text=ink] at (1.3,8.2) {1-bit};
+\node[anchor=east, font=\fontsize{13}{15}\selectfont, text=gray1] at (\X0-0.35,7.95) {vendor fork};
+\vbar{7.35}{90.1}{90}
+\node[anchor=east, font=\fontsize{13}{15}\selectfont\bfseries, text=acc] at (\X0-0.35,6.55) {bonsai-turbo};
+\obar{5.95}{158.7}{159}{1.76x}
+
+% ---- trust line + url ----
+\draw[ink, line width=0.6pt] (1.3,3.5) -- (30.7,3.5);
+\node[anchor=west, font=\fontsize{14}{17}\selectfont, text=ink] at (1.3,2.55)
+  {Same outputs: identical greedy tokens on 32 of 32 prompts vs the vendor fork.};
+\node[anchor=east, font=\fontsize{13}{16}\selectfont, text=gray1] at (30.7,2.55)
+  {github.com/RightNow-AI/bonsai-turbo};
+
+\end{tikzpicture}
+\end{document}

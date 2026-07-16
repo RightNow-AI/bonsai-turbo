@@ -18,26 +18,26 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("texlive-latex-base", "texlive-latex-extra", "texlive-pictures",
                  "texlive-fonts-recommended", "poppler-utils")
-    .add_local_file(REPO_ROOT / "docs" / "assets" / "overview.tex", "/work/overview.tex")
+    .add_local_dir(REPO_ROOT / "docs" / "assets", "/work", ignore=["*.png", "*.pdf"])
 )
 
 
 @app.function(image=image, timeout=600)
-def build() -> bytes:
+def build(name: str = "overview", w: int = 2560, h: int = 1280) -> bytes:
     for cmd in (
-        ["pdflatex", "-interaction=nonstopmode", "-output-directory", "/tmp", "/work/overview.tex"],
-        ["pdftoppm", "-png", "-scale-to-x", "2560", "-scale-to-y", "1280",
-         "-singlefile", "/tmp/overview.pdf", "/tmp/overview"],
+        ["pdflatex", "-interaction=nonstopmode", "-output-directory", "/tmp", f"/work/{name}.tex"],
+        ["pdftoppm", "-png", "-scale-to-x", str(w), "-scale-to-y", str(h),
+         "-singlefile", f"/tmp/{name}.pdf", f"/tmp/{name}"],
     ):
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode:
             raise RuntimeError(f"{cmd[0]} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-1000:]}")
-    return Path("/tmp/overview.png").read_bytes()
+    return Path(f"/tmp/{name}.png").read_bytes()
 
 
 @app.local_entrypoint()
-def main():
-    png = build.remote()
-    out = REPO_ROOT / "docs" / "assets" / "overview.png"
+def main(name: str = "overview", w: int = 2560, h: int = 1280):
+    png = build.remote(name=name, w=w, h=h)
+    out = REPO_ROOT / "docs" / "assets" / f"{name}.png"
     out.write_bytes(png)
     print(f"wrote {out} ({len(png)} bytes)")
